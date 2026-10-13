@@ -128,7 +128,6 @@ func (v *Viewer) cancelFile() error {
 	}
 }
 
-// Original KeepSendingFile uses 1-based offsets and 32000-byte blocks.
 func (v *Viewer) sendFileChunkLocked(session *controlSession) error {
 	transfer, upload := v.state.Transfer, v.upload
 	if upload.sent >= transfer.Size {

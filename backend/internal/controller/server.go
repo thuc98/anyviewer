@@ -1,6 +1,3 @@
-// Web portal for the UltraViewer Linux controller.
-// Supports dynamic Partner ID & Password from the web interface.
-// Go port of server.py (the web-portal variant) + viewer.html.
 package controller
 
 import (
@@ -38,27 +35,26 @@ type viewerState struct {
 	Incoming []*incomingFileState `json:"incoming,omitempty"`
 }
 
-// Viewer owns the connection lifecycle and the latest rendered frame.
 type Viewer struct {
-	reg            registrationProfile
-	partner        partnerProfile
-	dictionary     []byte
-	width          int
-	height         int
-	blockSize      int
-	certPolicy     bool
-	timeout        time.Duration
-	settings       viewerSettings
-	settingsPath   string
-	settingsFileMu *sync.Mutex
-	onSettings     func(viewerSettings)
-	clipboard      clipboardState
-	clipboardSent  string
+	standaloneSettings bool
+	reg                registrationProfile
+	dictionary         []byte
+	width              int
+	height             int
+	blockSize          int
+	certPolicy         bool
+	timeout            time.Duration
+	settings           viewerSettings
+	settingsPath       string
+	settingsFileMu     *sync.Mutex
+	onSettings         func(viewerSettings)
+	clipboard          clipboardState
+	clipboardSent      string
 
-	lifecycle sync.Mutex // serializes connect/disconnect transitions
-	closing   bool       // guarded by lifecycle
+	lifecycle sync.Mutex
+	closing   bool
 
-	mu          sync.Mutex // guards the fields below
+	mu          sync.Mutex
 	commands    chan cmdItem
 	frame       []byte
 	state       viewerState
@@ -151,7 +147,6 @@ func (v *Viewer) disconnect() {
 	}
 }
 
-// shutdown waits for key/button releases and transport cleanup before exiting.
 func (v *Viewer) shutdown() {
 	v.lifecycle.Lock()
 	defer v.lifecycle.Unlock()
@@ -187,7 +182,6 @@ func stopped(stop chan struct{}) bool {
 	}
 }
 
-// event validates an input event, then enqueues it for the relay goroutine.
 func (v *Viewer) event(value map[string]interface{}) error {
 	evType, _ := value["type"].(string)
 	var payload []byte
@@ -257,8 +251,18 @@ func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done
 	var runErr error
 	session := newControlSession(v.timeout, v.certPolicy)
 	session.settings = settings
+	started := time.Now()
+	firstFrame := true
 
 	defer func() {
+		reason := "remote_closed"
+		if stopped(stop) {
+			reason = "requested"
+		} else if runErr != nil {
+			reason = "error"
+			session.logf("event=viewer status=failed error=%q", runErr)
+		}
+		session.logf("event=viewer status=disconnected reason=%q elapsed=%s", reason, time.Since(started))
 		for vk := range keys {
 			session.key(vk, false)
 		}
@@ -391,6 +395,7 @@ func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done
 		}
 		switch kind {
 		case 0:
+			session.logf("event=viewer status=connected elapsed=%s", time.Since(started))
 			v.setState("connected")
 		case 1:
 			if _, e := screen.apply(fields); e != nil {
@@ -401,6 +406,10 @@ func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done
 			if e := png.Encode(&buf, screen.canvas); e != nil {
 				runErr = e
 				return
+			}
+			if firstFrame {
+				session.logf("event=screen status=first_frame width=%d height=%d elapsed=%s", screen.canvas.Bounds().Dx(), screen.canvas.Bounds().Dy(), time.Since(started))
+				firstFrame = false
 			}
 			v.mu.Lock()
 			v.frame = buf.Bytes()
@@ -413,8 +422,6 @@ func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done
 		}
 	}
 }
-
-// ---- JSON helpers --------------------------------------------------------
 
 func jsonInt(m map[string]interface{}, key string) (int, error) {
 	v, ok := m[key]
@@ -451,8 +458,6 @@ func jsonBool(m map[string]interface{}, key string) (bool, error) {
 	}
 	return b, nil
 }
-
-// ---- HTTP handler --------------------------------------------------------
 
 func reply(w http.ResponseWriter, code int, data []byte, kind string) {
 	w.Header().Set("Content-Type", kind)

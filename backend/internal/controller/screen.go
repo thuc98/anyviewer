@@ -1,9 +1,3 @@
-// Decode observed RGB555 Zstandard rectangle updates, JPEG atlas tiles, tile
-// cache references/additions and scroll-copy. Go port of screen_decode.py.
-//
-// Field mapping follows VRecordReader.ManipulatePacket (13a2) and drawer
-// constructor c8b; worker c65 consumes references before pixel updates and saves
-// cache additions afterwards. BitBlt remains an explicit unsupported operation.
 package controller
 
 import (
@@ -19,7 +13,6 @@ import (
 
 const maxDecodeOutput = 64 * 1024 * 1024
 
-// zstdDictDecoder decompresses frames with a fixed dictionary.
 type zstdDictDecoder struct {
 	dec *zstd.Decoder
 }
@@ -49,11 +42,9 @@ func (z *zstdDictDecoder) decompress(payload []byte, expectedSize int) ([]byte, 
 	return out, nil
 }
 
-// ---- RGBA image helpers --------------------------------------------------
-
 func newCanvas(w, h int) *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
-	// Opaque black background, matching Image.new('RGB', size) rendered to PNG.
+
 	for i := 3; i < len(img.Pix); i += 4 {
 		img.Pix[i] = 255
 	}
@@ -66,7 +57,6 @@ func cloneCanvas(src *image.RGBA) *image.RGBA {
 	return dst
 }
 
-// pasteImage copies src onto dst at (dx,dy), clipping to dst bounds.
 func pasteImage(dst, src *image.RGBA, dx, dy int) {
 	sw := src.Rect.Dx()
 	sh := src.Rect.Dy()
@@ -89,7 +79,6 @@ func pasteImage(dst, src *image.RGBA, dx, dy int) {
 	}
 }
 
-// cropImage returns an independent copy of the (x,y,w,h) region of src.
 func cropImage(src *image.RGBA, x, y, w, h int) *image.RGBA {
 	out := image.NewRGBA(image.Rect(0, 0, w, h))
 	for row := 0; row < h; row++ {
@@ -100,11 +89,9 @@ func cropImage(src *image.RGBA, x, y, w, h int) *image.RGBA {
 	return out
 }
 
-// ---- LRU tile cache ------------------------------------------------------
-
 type tileCache struct {
 	items map[int32]*image.RGBA
-	order []int32 // front = least recently used
+	order []int32
 	limit int
 }
 
@@ -135,13 +122,11 @@ func (c *tileCache) removeOrder(key int32) {
 	}
 }
 
-// touch moves an existing key to the most-recently-used position.
 func (c *tileCache) touch(key int32) {
 	c.removeOrder(key)
 	c.order = append(c.order, key)
 }
 
-// add inserts a new key (only when absent), appended as most recently used.
 func (c *tileCache) add(key int32, img *image.RGBA) {
 	if _, ok := c.items[key]; ok {
 		return
@@ -157,8 +142,6 @@ func (c *tileCache) trim() {
 		delete(c.items, oldest)
 	}
 }
-
-// ---- RGB555Screen --------------------------------------------------------
 
 type rgb555Screen struct {
 	canvas    *image.RGBA
@@ -194,8 +177,6 @@ func i16(b []byte) int   { return int(int16(binary.LittleEndian.Uint16(b))) }
 func i32(b []byte) int32 { return int32(binary.LittleEndian.Uint32(b)) }
 func u16(b []byte) int   { return int(binary.LittleEndian.Uint16(b)) }
 
-// updateSize derives the minimum canvas needed by validated rectangle records.
-// The wire format does not provide a negotiated size in this recovered path.
 func (s *rgb555Screen) updateSize(fields [][]byte) (int, int, error) {
 	width, height := s.width, s.height
 	include := func(x, y, w, h int) error {
@@ -256,8 +237,6 @@ func (s *rgb555Screen) updateSize(fields [][]byte) (int, int, error) {
 	return width, height, nil
 }
 
-// apply decodes one eleven-field kind1 update onto a working copy, committing the
-// new canvas and cache only when every rectangle validates.
 func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 	if len(fields) != 11 || len(fields[0]) == 0 || fields[0][0] != 1 {
 		return 0, errors.New("expected eleven-field kind1 update")
@@ -286,7 +265,6 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 	cache := s.cache.clone()
 	count := 0
 
-	// Scroll-copy (fields[6]).
 	if len(fields[6]) != 0 {
 		if len(fields[6]) < 10 || (len(fields[6])-10)%8 != 0 {
 			return 0, errors.New("invalid scroll-copy record length")
@@ -299,8 +277,7 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 		if err := s.bounds(x, y, w, h); err != nil {
 			return 0, err
 		}
-		// c65 copies old screen into an intermediate bitmap at (x,y-delta), then
-		// restores listed subrectangles.
+
 		shifted := newCanvas(s.width, s.height)
 		pasteImage(shifted, cropImage(canvas, x, y, w, h), x, y-delta)
 		rest := fields[6][10:]
@@ -320,7 +297,6 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 		}
 	}
 
-	// Cache references (fields[9]): records of (int16 x, int16 y, int32 key).
 	for off := 0; off < len(fields[9]); off += 8 {
 		x := i16(fields[9][off : off+2])
 		y := i16(fields[9][off+2 : off+4])
@@ -337,7 +313,6 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 		count++
 	}
 
-	// JPEG atlas (fields[7] image, fields[8] rectangles).
 	if len(fields[7]) != 0 || len(fields[8]) != 0 {
 		if !bytes.HasPrefix(fields[7], []byte{0xff, 0xd8}) || len(fields[8]) == 0 || len(fields[8])%8 != 0 {
 			return 0, errors.New("invalid JPEG atlas fields")
@@ -351,8 +326,7 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 		if aw*ah > 32*1024*1024 {
 			return 0, errors.New("JPEG atlas outside allocation policy")
 		}
-		// Native TJFLAG_BOTTOMUP then ordinal60 reads increasing rows: flip
-		// vertically into an RGBA atlas.
+
 		atlas := image.NewRGBA(image.Rect(0, 0, aw, ah))
 		sb := src.Bounds()
 		for row := 0; row < ah; row++ {
@@ -390,7 +364,6 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 		}
 	}
 
-	// RGB555 pixel update (fields[1] rectangles, fields[2] zstd stream).
 	if len(fields[1]) != 0 && len(fields[2]) != 0 {
 		n, err := s.applyRGB555(canvas, fields[1], fields[2])
 		if err != nil {
@@ -399,7 +372,6 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 		count += n
 	}
 
-	// Cache additions (fields[10]): records of (int16 x,y,w,h, int32 key).
 	for off := 0; off < len(fields[10]); off += 12 {
 		x := i16(fields[10][off : off+2])
 		y := i16(fields[10][off+2 : off+4])
@@ -421,7 +393,6 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 	return count, nil
 }
 
-// applyRGB555 validates and applies the Zstandard RGB555 rectangle stream.
 func (s *rgb555Screen) applyRGB555(canvas *image.RGBA, rectField, pixelField []byte) (int, error) {
 	if len(rectField) == 0 || len(rectField)%8 != 0 {
 		return 0, errors.New("expected UInt16 x/y/w/h rectangle records")
@@ -455,9 +426,9 @@ func (s *rgb555Screen) applyRGB555(canvas *image.RGBA, rectField, pixelField []b
 				word := binary.LittleEndian.Uint16(raw[offset : offset+2])
 				offset += 2
 				di := tile.PixOffset(px, py)
-				tile.Pix[di+0] = uint8(((word >> 10) & 31) * 255 / 31) // R (bits 10-14)
-				tile.Pix[di+1] = uint8(((word >> 5) & 31) * 255 / 31)  // G (bits 5-9)
-				tile.Pix[di+2] = uint8((word & 31) * 255 / 31)         // B (bits 0-4)
+				tile.Pix[di+0] = uint8(((word >> 10) & 31) * 255 / 31)
+				tile.Pix[di+1] = uint8(((word >> 5) & 31) * 255 / 31)
+				tile.Pix[di+2] = uint8((word & 31) * 255 / 31)
 				tile.Pix[di+3] = 255
 			}
 		}

@@ -67,10 +67,10 @@ export function useClipboard(connected, enabled, viewOnly) {
           if (value.error) setError(value.error);
           if (value.version && value.version !== remote.current.version) { remote.current=value; setPending(true); }
           if (remote.current.version && remote.current.version !== applied.current) {
-            // Try writing once per revision; manual Receive retries under user activation.
+
             if (remote.current.attempted !== true) { remote.current.attempted=true; await actions.current.receiveFromRemote(); }
           }
-          // Never upload the local clipboard while a remote update awaits permission.
+
           if (allowSend.current && canRead.current && (!remote.current.version || applied.current === remote.current.version)) await actions.current.sendFromLocal({quiet:true});
         }
       } catch (e) { if (!stopped && e.name !== 'AbortError') setError('Không thể đồng bộ clipboard.'); }

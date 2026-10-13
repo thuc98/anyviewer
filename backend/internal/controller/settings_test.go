@@ -19,11 +19,12 @@ func TestSettingsPersistenceAndLiveQuality(t *testing.T) {
 	}
 	v.state.State = "connected"
 	settings := viewerSettings{MachineName: "Support Mac", JPEGQuality: 70, Theme: "dark", RefreshInterval: 500}
+	settings.normalize()
 	if err := v.updateSettings(settings); err != nil {
 		t.Fatal(err)
 	}
 	command := <-v.commands
-	// Native Form1.ChangeDisplayQuality at 0x6e85b0 uses Unicode command 31.
+
 	if !command.unicode || !bytes.Equal(command.payload, utf16le("31|||70")) {
 		t.Fatal("quality setting did not send native command")
 	}
@@ -86,5 +87,40 @@ func TestSettingsQueueFullDoesNotSave(t *testing.T) {
 	}
 	if _, err := os.Stat(v.settingsPath); !os.IsNotExist(err) {
 		t.Fatal("saved settings without reserving a command slot")
+	}
+}
+
+func TestStandaloneSettingsCreateFileWithoutRegistration(t *testing.T) {
+	server, err := NewServer(Options{Width: 1, Height: 1, BlockSize: 32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Shutdown()
+	if len(server.base.reg.Terms) == 0 || len(server.base.dictionary) == 0 || !server.base.standaloneSettings {
+		t.Fatal("standalone resources were not initialized")
+	}
+	server.base.settingsPath = filepath.Join(t.TempDir(), "AnyViewer", "settings.json")
+	id := bootstrapSession(t, server.Handler())
+	viewer := server.sessions[id].viewer
+	settings := viewer.settings
+	settings.MachineName = "Standalone test"
+	settings.Theme = "dark"
+	if err := viewer.updateSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(viewer.settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]json.RawMessage
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if len(saved) != 1 || saved["viewer_settings"] == nil {
+		t.Fatal("standalone preferences include registration data")
+	}
+	fresh := newViewer(registrationProfile{}, nil, 1, 1, 32, true)
+	if err := fresh.loadSettings(viewer.settingsPath); err != nil || fresh.settings != settings {
+		t.Fatal("standalone settings did not survive reload")
 	}
 }

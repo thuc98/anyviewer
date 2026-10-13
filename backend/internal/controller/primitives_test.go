@@ -11,7 +11,7 @@ import (
 )
 
 func TestEncryptRegistrationBytes(t *testing.T) {
-	// Cross-checked against openssl des-ede3-cbc with the derived key/IV.
+
 	got, err := encryptRegistrationBytes([]byte("3:hello-ultraviewer"))
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +58,7 @@ func TestEncodeRelayFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// body: [0, flag, addr(LE of 0x01020304), port(LE)] + "abc"
+
 	want := []byte{11, 0, 0, 0, 0, 0, 0x04, 0x03, 0x02, 0x01, 0x07, 0x00, 'a', 'b', 'c'}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("relay frame = %v, want %v", got, want)
@@ -181,7 +181,7 @@ func TestBuildLoginWithPassword(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Decode UTF-16LE back and confirm the sensitive positions were filled.
+
 	if len(out)%2 != 0 {
 		t.Fatal("login command must be UTF-16LE")
 	}
@@ -224,7 +224,7 @@ func splitColon(s string) []string {
 }
 
 func TestAtlasLayout(t *testing.T) {
-	// One 40x40 rectangle with block size 32 and a 64-high atlas: four tiles.
+
 	tiles, err := atlasLayout([][4]int{{0, 0, 40, 40}}, 32, 64)
 	if err != nil {
 		t.Fatal(err)
@@ -232,11 +232,11 @@ func TestAtlasLayout(t *testing.T) {
 	if len(tiles) != 4 {
 		t.Fatalf("expected 4 tiles, got %d", len(tiles))
 	}
-	// First tile: top-left 32x32 at atlas (0,0).
+
 	if tiles[0] != (atlasTile{x: 0, y: 0, w: 32, h: 32, sx: 0, sy: 0}) {
 		t.Fatalf("tile0 = %+v", tiles[0])
 	}
-	// Second tile: (0,32) 32x8, stacked below in the same column at atlas y=32.
+
 	if tiles[1] != (atlasTile{x: 0, y: 32, w: 32, h: 8, sx: 0, sy: 32}) {
 		t.Fatalf("tile1 = %+v", tiles[1])
 	}
@@ -257,7 +257,7 @@ func TestRGB555Mapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer enc.Close()
-	// Pillow's BGR;15 output for all 32 channel values.
+
 	expected := []uint8{0, 8, 16, 24, 32, 41, 49, 57, 65, 74, 82, 90, 98, 106, 115, 123, 131, 139, 148, 156, 164, 172, 180, 189, 197, 205, 213, 222, 230, 238, 246, 255}
 	raw := make([]byte, 32*3*2)
 	for channel, shift := range []uint{10, 5, 0} {

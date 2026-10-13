@@ -22,5 +22,5 @@ debug: frontend
 
 run-debug: debug
 
-test:
+test: frontend
 	cd backend && go test -race ./...

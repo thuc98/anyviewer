@@ -1,6 +1,3 @@
-// Linux control session assembled from the verified registration/relay paths.
-// Keeps registration alive while relaying, sends input and returns raw split
-// screen updates for a renderer. Go port of control_session.py.
 package controller
 
 import (
@@ -8,33 +5,48 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
+	"net"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// registrationProfile mirrors the controller-config.json schema.
 type registrationProfile struct {
 	Terms                           []string `json:"terms"`
 	AnsiCodec                       string   `json:"ansi_codec"`
 	ExperimentalLinuxMetadataPolicy bool     `json:"experimental_linux_metadata_policy"`
 }
 
-// partnerProfile contains credentials supplied for one connection.
+func defaultRegistrationProfile() (registrationProfile, error) {
+	identity, err := randomToken()
+	if err != nil {
+		return registrationProfile{}, err
+	}
+	return registrationProfile{
+		AnsiCodec:                       "cp1252",
+		ExperimentalLinuxMetadataPolicy: true,
+		Terms: []string{"3", identity[:32], digits(8), "0", "AnyViewer", "0",
+			"aG9zdGluZw==", "6.6.133", "QW55Vmlld2Vy", "", "0|6|0|8|0|0",
+			"0", "", "", "0", "en", "user", "0", "0", digits(9), "0", "1", "0:0:0", "", "", ""},
+	}, nil
+}
+
 type partnerProfile struct {
 	RequestTerms []string `json:"request_terms"`
 	Password     string   `json:"password"`
 	PasswordType int      `json:"password_type"`
 }
 
-// Request metadata is protocol framing; target identity and credentials are per session.
 func makePartnerProfile(id, password string) partnerProfile {
 	return partnerProfile{RequestTerms: []string{"8", id, "", "6.6.133", "", "", "", "", "-1", "0", "0", "0", "", "420", "0", "", ""}, Password: strings.TrimSpace(password), PasswordType: 0}
 }
 
 type controlSession struct {
+	logID        string
 	timeout      time.Duration
 	certPolicy   bool
 	registration *transport
@@ -46,11 +58,16 @@ type controlSession struct {
 	loginAcknowledged bool
 }
 
-func newControlSession(timeout time.Duration, certPolicy bool) *controlSession {
-	return &controlSession{timeout: timeout, certPolicy: certPolicy, settings: defaultViewerSettings()}
+var connectionSequence atomic.Uint64
+
+func (s *controlSession) logf(format string, args ...any) {
+	log.Printf("connection=%s %s", s.logID, fmt.Sprintf(format, args...))
 }
 
-// digits returns n cryptographically-random decimal digits.
+func newControlSession(timeout time.Duration, certPolicy bool) *controlSession {
+	return &controlSession{logID: strconv.FormatUint(connectionSequence.Add(1), 10), timeout: timeout, certPolicy: certPolicy, settings: defaultViewerSettings()}
+}
+
 func digits(n int) string {
 	var b strings.Builder
 	for i := 0; i < n; i++ {
@@ -62,16 +79,24 @@ func digits(n int) string {
 
 func (s *controlSession) connect(reg registrationProfile, partner partnerProfile) (err error) {
 	s.close()
+	started := time.Now()
 	stage := "validate profiles"
+	s.logf("event=connect status=starting")
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("%s: %w", stage, err)
+			s.logf("event=connect status=failed stage=%q elapsed=%s error=%q", stage, time.Since(started), err)
 		}
 	}()
 	s.codec = reg.AnsiCodec
 	terms := append([]string(nil), partner.RequestTerms...)
 	if len(terms) != 17 {
 		return errors.New("partner request needs seventeen terms")
+	}
+	s.logf("event=connect status=validated partner_id=%q", terms[1])
+	regCmd, err := buildRegistrationCommand(reg.Terms, s.codec)
+	if err != nil {
+		return err
 	}
 	defer func() {
 		if err != nil {
@@ -81,18 +106,18 @@ func (s *controlSession) connect(reg registrationProfile, partner partnerProfile
 
 	stage = "registration tunnel"
 	s.registration = newTransport(s.timeout, s.certPolicy)
-	if err = s.registration.connectRegistration(defaultRegHost, 443); err != nil {
-		return err
-	}
-	regCmd, err := buildRegistrationCommand(reg.Terms, s.codec)
-	if err != nil {
+	s.registration.logID, s.registration.role = s.logID, "registration"
+	s.registration.settings = s.settings
+	if err = s.registration.connectRegistration(s.settings.RegistrationHost, 443); err != nil {
 		return err
 	}
 	stage = "send registration"
+	s.logf("event=registration status=sending")
 	if err = s.registration.sendCommand(regCmd); err != nil {
 		return err
 	}
 	stage = "receive registration identity"
+	s.logf("event=registration status=waiting_for_identity")
 	idPayload, err := s.registration.receiveMode1Payload()
 	if err != nil {
 		return err
@@ -102,6 +127,7 @@ func (s *controlSession) connect(reg registrationProfile, partner partnerProfile
 		return err
 	}
 
+	s.logf("event=registration status=identity_received")
 	terms[2], err = connectionRequestPasswordValue(partner.Password, partner.PasswordType, s.codec)
 	if err != nil {
 		return err
@@ -118,11 +144,13 @@ func (s *controlSession) connect(reg registrationProfile, partner partnerProfile
 		return err
 	}
 	stage = "send partner request"
+	s.logf("event=partner_request status=sending partner_id=%q", terms[1])
 	if err = s.registration.sendCommand(connCmd); err != nil {
 		return err
 	}
 
 	stage = "receive partner route"
+	s.logf("event=partner_route status=waiting")
 	for i := 0; i < 4; i++ {
 		response, rerr := s.registration.receiveMode1Payload()
 		if rerr != nil {
@@ -157,9 +185,12 @@ func (s *controlSession) connect(reg registrationProfile, partner partnerProfile
 	if s.route == nil {
 		return errors.New("Không nhận được thông tin định tuyến từ đối tác")
 	}
+	s.logf("event=partner_route status=received relay=%q http_host=%q target=%q lan=%q command_port=%d", net.JoinHostPort(s.route.tcpServerIP, "443"), s.route.tcpServerHostname, net.JoinHostPort(s.route.publicIP, strconv.Itoa(s.route.tcpPort)), net.JoinHostPort(s.route.lanIP, strconv.Itoa(s.route.lanPort)), s.route.commandPort)
 
 	stage = "relay tunnel"
 	s.relay = newTransport(s.timeout, s.certPolicy)
+	s.relay.logID, s.relay.role = s.logID, "relay"
+	s.relay.settings = s.settings
 	if err = s.relay.connectSession(s.route.tcpServerIP, 443, s.route.tcpServerHostname, true); err != nil {
 		return err
 	}
@@ -178,7 +209,12 @@ func (s *controlSession) connect(reg registrationProfile, partner partnerProfile
 		return err
 	}
 	stage = "send partner login"
-	return s.relay.sendRelay(payload, s.route.publicIP, s.route.tcpPort, true)
+	s.logf("event=partner_login status=sending")
+	if err = s.relay.sendRelay(payload, s.route.publicIP, s.route.tcpPort, true); err != nil {
+		return err
+	}
+	s.logf("event=partner_login status=waiting_for_ack elapsed=%s", time.Since(started))
+	return nil
 }
 
 func (s *controlSession) send(payload []byte) error { return s.sendWithEncoding(payload, false) }
@@ -190,8 +226,6 @@ func (s *controlSession) sendWithEncoding(payload []byte, unicodeBytes bool) err
 	return s.relay.sendRelay(payload, s.route.publicIP, s.route.tcpPort, unicodeBytes)
 }
 
-// receive reads one relay packet and returns its discriminator kind and fields.
-// It transparently answers the login ack (kind 0) and the keepalive (kind 3).
 func (s *controlSession) receive() (int, [][]byte, error) {
 	if s.relay == nil {
 		return 0, nil, errors.New("session is closed")
@@ -229,7 +263,6 @@ func (s *controlSession) receive() (int, [][]byte, error) {
 	return kind, fields, nil
 }
 
-// acknowledgeScreen is called by the renderer only after it accepts the update.
 func (s *controlSession) acknowledgeScreen() error {
 	return s.send([]byte("18"))
 }

@@ -3,3 +3,7 @@ bin/
 frontend/node_modules/
 config/*.json
 config/legacy/*.json
+
+backend/internal/webui/dist/
+
+backend/internal/controller/private/

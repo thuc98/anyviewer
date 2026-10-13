@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -35,6 +36,7 @@ type Server struct {
 	mu       sync.Mutex
 	sessions map[string]*tabSession
 	closed   bool
+	cleanup  sync.WaitGroup
 }
 
 func randomToken() (string, error) {
@@ -45,13 +47,19 @@ func randomToken() (string, error) {
 	return hex.EncodeToString(data[:]), nil
 }
 func NewServer(options Options) (*Server, error) {
-	var reg registrationProfile
-	data, err := os.ReadFile(options.ConfigPath)
+	reg, err := defaultRegistrationProfile()
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(data, &reg); err != nil {
-		return nil, err
+	data := []byte("{}")
+	if options.ConfigPath != "" {
+		data, err = os.ReadFile(options.ConfigPath)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(data, &reg); err != nil {
+			return nil, err
+		}
 	}
 	dictionary := defaultDictionary
 	if options.DictionaryPath != "" {
@@ -61,8 +69,25 @@ func NewServer(options Options) (*Server, error) {
 		}
 	}
 	base := newViewer(reg, dictionary, options.Width, options.Height, options.BlockSize, true)
-	if err := base.loadSettings(options.ConfigPath); err != nil {
+	if err := base.loadSettingsData(data); err != nil {
 		return nil, err
+	}
+	if options.ConfigPath != "" {
+		base.settingsPath = options.ConfigPath
+	} else {
+		dir, err := os.UserConfigDir()
+		if err != nil {
+			return nil, err
+		}
+		base.settingsPath = filepath.Join(dir, "AnyViewer", "settings.json")
+		base.standaloneSettings = true
+		if _, err := os.Stat(base.settingsPath); err == nil {
+			if err := base.loadSettings(base.settingsPath); err != nil {
+				return nil, err
+			}
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
 	}
 	token, err := randomToken()
 	if err != nil {
@@ -95,6 +120,7 @@ func (s *Server) createSession() (string, *tabSession, error) {
 	viewer := newViewer(s.base.reg, s.base.dictionary, s.base.width, s.base.height, s.base.blockSize, s.base.certPolicy)
 	viewer.settings = s.base.settings
 	viewer.settingsPath = s.base.settingsPath
+	viewer.standaloneSettings = s.base.standaloneSettings
 	viewer.settingsFileMu = s.base.settingsFileMu
 	s.base.mu.Unlock()
 	viewer.onSettings = func(settings viewerSettings) { s.base.mu.Lock(); s.base.settings = settings; s.base.mu.Unlock() }
@@ -157,15 +183,20 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) expireSessions(now time.Time) {
 	var expired []*Viewer
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
 	for id, session := range s.sessions {
 		if now.Sub(session.lastSeen) > 5*time.Minute {
 			delete(s.sessions, id)
 			expired = append(expired, session.viewer)
+			s.cleanup.Add(1)
 		}
 	}
 	s.mu.Unlock()
 	for _, viewer := range expired {
-		go viewer.shutdown()
+		go func(v *Viewer) { defer s.cleanup.Done(); v.shutdown() }(viewer)
 	}
 }
 func (s *Server) Shutdown() {
@@ -184,6 +215,7 @@ func (s *Server) Shutdown() {
 		go func(v *Viewer) { defer done.Done(); v.shutdown() }(viewer)
 	}
 	done.Wait()
+	s.cleanup.Wait()
 }
 func (s *Server) Serve(ln net.Listener) error {
 	server := &http.Server{Handler: s.Handler()}

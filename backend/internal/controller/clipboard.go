@@ -17,8 +17,6 @@ type clipboardState struct {
 	Error   string `json:"error,omitempty"`
 }
 
-// The native 6.6.124 sender uses UTF-16 command 5 for short delimiter-free text,
-// and command 33 with an ANSI length header plus Zstandard-compressed UTF-16LE.
 func clipboardCommand(text string) ([]byte, bool, error) {
 	if !utf8.ValidString(text) || strings.ContainsRune(text, 0) {
 		return nil, false, errors.New("invalid clipboard text")

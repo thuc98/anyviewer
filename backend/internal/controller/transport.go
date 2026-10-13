@@ -1,9 +1,8 @@
-// Recovered registration and relay transports. Windows login is the caller's
-// responsibility. Go port of registration_transport.py + session_transport.py.
 package controller
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -11,7 +10,10 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 const (
@@ -19,18 +21,23 @@ const (
 	tlsTargetHost  = "ultraviewer"
 )
 
-// errTimeout mirrors Python's TimeoutError on a receive deadline: the buffer is
-// preserved and the caller may retry.
 var errTimeout = errors.New("transport deadline")
 
 type transport struct {
 	timeout    time.Duration
 	maxFrame   int
-	certPolicy bool // original-certificate-policy: accept any server certificate
+	certPolicy bool
 	conn       net.Conn
 	buffer     []byte
 	readbuf    []byte
 	respHeader []byte
+	settings   viewerSettings
+	logID      string
+	role       string
+}
+
+func (t *transport) logf(format string, args ...any) {
+	log.Printf("connection=%s transport=%s %s", t.logID, t.role, fmt.Sprintf(format, args...))
 }
 
 func newTransport(timeout time.Duration, certPolicy bool) *transport {
@@ -39,35 +46,86 @@ func newTransport(timeout time.Duration, certPolicy bool) *transport {
 		maxFrame:   1024 * 1024,
 		certPolicy: certPolicy,
 		readbuf:    make([]byte, 4096),
+		settings:   defaultViewerSettings(),
+		role:       "transport",
 	}
 }
 
 func (t *transport) tlsConfig() *tls.Config {
-	cfg := &tls.Config{ServerName: tlsTargetHost}
+	cfg := &tls.Config{ServerName: t.settings.TLSServerName}
 	if t.certPolicy {
-		// Original RC40 callback returns true for every certificate.
+
 		cfg.InsecureSkipVerify = true
 	}
 	return cfg
 }
 
-// connectRegistration opens the registration tunnel (HTTP 200 expected).
+func (t *transport) dial(host string, port int) (conn net.Conn, err error) {
+	address := net.JoinHostPort(host, fmt.Sprint(port))
+	started := time.Now()
+	route := "direct"
+	if t.settings.SOCKS5Enabled {
+		route = "socks5://" + net.JoinHostPort(t.settings.SOCKS5Host, strconv.Itoa(t.settings.SOCKS5Port))
+	}
+	t.logf("event=tcp_dial status=starting destination=%q route=%q proxy_auth=%t timeout=%s", address, route, t.settings.SOCKS5Enabled && t.settings.SOCKS5Username != "", t.timeout)
+	defer func() {
+		if err != nil {
+			t.logf("event=tcp_dial status=failed destination=%q route=%q elapsed=%s error=%q", address, route, time.Since(started), err)
+		} else {
+			t.logf("event=tcp_dial status=connected destination=%q local=%q peer=%q elapsed=%s", address, conn.LocalAddr(), conn.RemoteAddr(), time.Since(started))
+		}
+	}()
+	forward := &net.Dialer{Timeout: t.timeout}
+	ctx, cancel := context.WithTimeout(context.Background(), t.timeout)
+	defer cancel()
+	if !t.settings.SOCKS5Enabled {
+		return forward.DialContext(ctx, "tcp", address)
+	}
+	var auth *proxy.Auth
+	if t.settings.SOCKS5Username != "" {
+		auth = &proxy.Auth{User: t.settings.SOCKS5Username, Password: t.settings.SOCKS5Password}
+	}
+	dialer, err := proxy.SOCKS5("tcp", net.JoinHostPort(t.settings.SOCKS5Host, strconv.Itoa(t.settings.SOCKS5Port)), auth, forward)
+	if err != nil {
+		return nil, fmt.Errorf("SOCKS5 proxy: %w", err)
+	}
+	conn, err = dialer.(proxy.ContextDialer).DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("SOCKS5 proxy: %w", err)
+	}
+	return conn, nil
+}
+
+func (t *transport) handshake(raw net.Conn) (*tls.Conn, error) {
+	started := time.Now()
+	t.logf("event=tls_handshake status=starting server_name=%q verify_certificate=%t", t.settings.TLSServerName, !t.certPolicy)
+	conn := tls.Client(raw, t.tlsConfig())
+	conn.SetDeadline(time.Now().Add(t.timeout))
+	if err := conn.Handshake(); err != nil {
+		t.logf("event=tls_handshake status=failed elapsed=%s error=%q", time.Since(started), err)
+		return nil, err
+	}
+	conn.SetDeadline(time.Time{})
+	state := conn.ConnectionState()
+	t.logf("event=tls_handshake status=connected version=%q cipher=%q elapsed=%s", tls.VersionName(state.Version), tls.CipherSuiteName(state.CipherSuite), time.Since(started))
+	return conn, nil
+}
+
 func (t *transport) connectRegistration(host string, port int) error {
 	if t.conn != nil {
 		return errors.New("already connected")
 	}
-	raw, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), t.timeout)
+	raw, err := t.dial(host, port)
 	if err != nil {
 		return fmt.Errorf("TCP dial: %w", err)
 	}
-	conn := tls.Client(raw, t.tlsConfig())
-	conn.SetDeadline(time.Now().Add(t.timeout))
-	if err := conn.Handshake(); err != nil {
+	conn, err := t.handshake(raw)
+	if err != nil {
 		raw.Close()
 		return fmt.Errorf("TLS handshake: %w", err)
 	}
-	conn.SetDeadline(time.Time{})
 	t.conn = conn
+	t.logf("event=http_tunnel status=starting host=%q", host)
 	if err := t.writeAll(httpServicePreface(host)); err != nil {
 		t.Close()
 		return fmt.Errorf("send HTTP preface: %w", err)
@@ -78,43 +136,41 @@ func (t *transport) connectRegistration(host string, port int) error {
 		return fmt.Errorf("receive HTTP response: %w", err)
 	}
 	t.respHeader = header
-	// Original just strips the header; reconstructed client checks status.
+
 	firstLine := header
 	if i := bytes.Index(header, []byte("\r\n")); i >= 0 {
 		firstLine = header[:i]
 	}
+	t.logf("event=http_tunnel status=response http_status=%q", firstLine)
 	if !bytes.Equal(firstLine, []byte("HTTP/1.1 200 OK")) {
 		t.Close()
 		return errors.New("registration tunnel did not return HTTP 200")
 	}
+	t.logf("event=http_tunnel status=ready")
 	return nil
 }
 
-// connectSession opens the relay transport to the resolved endpoint.
 func (t *transport) connectSession(host string, port int, httpHostname string, useSSL bool) error {
 	if t.conn != nil {
 		return errors.New("already connected")
 	}
 
-	log.Println("connect to", host)
-
-	raw, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), t.timeout)
+	raw, err := t.dial(host, port)
 	if err != nil {
 		return fmt.Errorf("TCP dial: %w", err)
 	}
 	t.conn = raw
 	if useSSL {
-		conn := tls.Client(raw, t.tlsConfig())
-		conn.SetDeadline(time.Now().Add(t.timeout))
-		if err := conn.Handshake(); err != nil {
+		conn, err := t.handshake(raw)
+		if err != nil {
 			raw.Close()
 			t.conn = nil
 			return fmt.Errorf("TLS handshake: %w", err)
 		}
-		conn.SetDeadline(time.Time{})
 		t.conn = conn
 	}
 	if httpHostname != "" {
+		t.logf("event=http_tunnel status=starting host=%q", httpHostname)
 		if err := t.writeAll(httpServicePreface(httpHostname)); err != nil {
 			t.Close()
 			return fmt.Errorf("send HTTP preface: %w", err)
@@ -125,10 +181,12 @@ func (t *transport) connectSession(host string, port int, httpHostname string, u
 			return fmt.Errorf("receive HTTP response: %w", err)
 		}
 		t.respHeader = header
+		t.logf("event=http_tunnel status=response http_status=%q", bytes.SplitN(header, []byte("\r\n"), 2)[0])
 		if !bytes.HasPrefix(header, []byte("HTTP/1.1 200 ")) {
 			t.Close()
 			return errors.New("session tunnel did not return HTTP 200")
 		}
+		t.logf("event=http_tunnel status=ready")
 	}
 	return nil
 }
@@ -143,8 +201,6 @@ func (t *transport) writeAll(data []byte) error {
 	return err
 }
 
-// fill performs one bounded read, appending to the buffer. It returns errTimeout
-// on the deadline (buffer preserved) and io.EOF when the peer closes.
 func (t *transport) fill(deadline time.Time) error {
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
@@ -194,8 +250,6 @@ func (t *transport) consume(n int) {
 	t.buffer = rest
 }
 
-// sendCommand encrypts a caller-supplied ANSI command and sends a VTCP mode1
-// frame with registration flag0.
 func (t *transport) sendCommand(plaintext []byte) error {
 	if t.conn == nil {
 		return errors.New("not connected")
@@ -204,8 +258,7 @@ func (t *transport) sendCommand(plaintext []byte) error {
 	if err != nil {
 		return err
 	}
-	// InitMyPassword passes True as Send argument6; argument5=False becomes
-	// byte0 at body offset1 (E151).
+
 	body := append([]byte{0x01, 0x00}, encrypted...)
 	if len(body) > t.maxFrame {
 		return errors.New("outbound frame exceeds limit")
@@ -217,7 +270,6 @@ func (t *transport) sendCommand(plaintext []byte) error {
 	return t.writeAll(frame)
 }
 
-// sendRelay sends a relay frame toward the target endpoint.
 func (t *transport) sendRelay(payload []byte, targetIP string, targetPort int, unicodeBytes bool) error {
 	if t.conn == nil {
 		return errors.New("not connected")
@@ -236,7 +288,6 @@ func (t *transport) sendRelay(payload []byte, targetIP string, targetPort int, u
 	return t.writeAll(frame)
 }
 
-// receiveBody reads one length-prefixed frame, returning errTimeout on deadline.
 func (t *transport) receiveBody() ([]byte, error) {
 	if t.conn == nil {
 		return nil, errors.New("not connected")
@@ -274,6 +325,7 @@ func (t *transport) receiveMode1Payload() ([]byte, error) {
 
 func (t *transport) Close() {
 	if t.conn != nil {
+		t.logf("event=transport_close status=closed local=%q peer=%q", t.conn.LocalAddr(), t.conn.RemoteAddr())
 		t.conn.Close()
 		t.conn = nil
 	}

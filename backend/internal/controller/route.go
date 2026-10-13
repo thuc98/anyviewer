@@ -1,5 +1,3 @@
-// Known command8 route fields recovered from Form1.ManipulateTargetInfo.
-// Decodes a status1 route response, not Windows session authentication.
 package controller
 
 import (
@@ -23,7 +21,6 @@ type targetRoute struct {
 	partnerSecretToken  string
 }
 
-// decodeTargetRoute decodes a status1 command8 route response.
 func decodeTargetRoute(payload []byte, codec string) (targetRoute, error) {
 	var r targetRoute
 	text, err := ansiDecode(payload, codec)

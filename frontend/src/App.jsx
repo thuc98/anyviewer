@@ -30,6 +30,7 @@ function Settings({ settings, display, connecting, onClose, onSave }) {
   const [draft, setDraft] = useState({ ...settings, ...display });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const [section, setSection] = useState('general');
   useEffect(() => { dialog.current.showModal(); }, []);
   async function save(event) {
     event.preventDefault(); setSaving(true); setError('');
@@ -38,7 +39,8 @@ function Settings({ settings, display, connecting, onClose, onSave }) {
   return <dialog ref={dialog} className="settings-dialog" onCancel={onClose} aria-labelledby="settings-title">
     <form onSubmit={save}>
       <div className="panel-heading"><h2 id="settings-title">Cài đặt</h2><button type="button" className="icon-button" aria-label="Đóng cài đặt" onClick={onClose}><Icon name="close"/></button></div>
-      <div className="settings-grid">
+      <div className="settings-tabs"><button type="button" className={section === 'general' ? 'selected' : ''} onClick={() => setSection('general')}>Chung</button><button type="button" className={section === 'network' ? 'selected' : ''} onClick={() => setSection('network')}>Mạng & proxy</button></div>
+      {section === 'general' ? <><div className="settings-grid">
         <label className="field full-width">Tên máy<input value={draft.machine_name} maxLength={128} required onChange={e => setDraft({...draft,machine_name:e.target.value})}/><span className="help">Áp dụng ở lần kết nối tiếp theo.</span></label>
         <label className="field">Giao diện<select value={draft.theme || 'light'} onChange={e => setDraft({...draft,theme:e.target.value})}><option value="light">Light · Sáng</option><option value="dark">Dark · Tối</option></select></label>
         <label className="field">Chất lượng remote<select value={draft.jpeg_quality} onChange={e => setDraft({...draft,jpeg_quality:Number(e.target.value)})}>{qualityPresets.map(q => <option key={q.value} value={q.value}>{q.name}</option>)}</select></label>
@@ -49,6 +51,20 @@ function Settings({ settings, display, connecting, onClose, onSave }) {
         <label className="switch-row"><span><strong>Chỉ xem màn hình</strong><small>Tắt điều khiển chuột và bàn phím</small></span><input type="checkbox" checked={draft.viewOnly} onChange={e => setDraft({...draft,viewOnly:e.target.checked})}/></label>
         <label className="switch-row"><span><strong>Đồng bộ clipboard</strong><small>Văn bản · có thể cần quyền trình duyệt</small></span><input type="checkbox" checked={!!draft.clipboard_sync} onChange={e => setDraft({...draft,clipboard_sync:e.target.checked})}/></label>
       </div>
+      </> : <>
+        <div className="settings-grid">
+          <label className="field">Registration host<input value={draft.registration_host || ''} placeholder="functions3.ultraviewer.net" onChange={e => setDraft({...draft,registration_host:e.target.value})}/></label>
+          <label className="field">TLS server name<input value={draft.tls_server_name || ''} placeholder="ultraviewer" onChange={e => setDraft({...draft,tls_server_name:e.target.value})}/></label>
+        </div>
+        <label className="switch-row proxy-switch"><span><strong>SOCKS5 proxy</strong></span><input type="checkbox" checked={!!draft.socks5_enabled} onChange={e => setDraft({...draft,socks5_enabled:e.target.checked})}/></label>
+        {draft.socks5_enabled && <div className="settings-grid">
+          <label className="field">Proxy host<input value={draft.socks5_host || ''} placeholder="127.0.0.1" required onChange={e => setDraft({...draft,socks5_host:e.target.value})}/></label>
+          <label className="field">Port<input type="number" min={1} max={65535} value={draft.socks5_port ?? 1080} required onChange={e => setDraft({...draft,socks5_port:Number(e.target.value)})}/></label>
+          <label className="field">Username<input value={draft.socks5_username || ''} autoComplete="off" onChange={e => setDraft({...draft,socks5_username:e.target.value})}/></label>
+          <label className="field">Password<input type="password" value={draft.socks5_password || ''} autoComplete="new-password" onChange={e => setDraft({...draft,socks5_password:e.target.value})}/></label>
+        </div>}
+        <p className="help">Áp dụng ở lần kết nối tiếp theo. Để trống username/password nếu proxy không yêu cầu đăng nhập.</p>
+      </>}
       {error && <p className="error" role="alert">{error}</p>}
       {connecting && <p className="help">Chờ kết nối hoàn tất trước khi lưu cài đặt.</p>}
       <div className="dialog-actions"><button type="button" className="secondary" onClick={onClose}>Đóng</button><button className="primary" disabled={saving || connecting}>{saving ? 'Đang lưu…' : 'Lưu cài đặt'}</button></div>
@@ -181,7 +197,7 @@ export default function App() {
   }
   async function disconnect() { setBusy(true); setError(''); try { await remote.disconnect(); } catch (e) { setError(e.message); } finally { setBusy(false); } }
   async function saveSettings(draft) {
-    const next={ machine_name:draft.machine_name, jpeg_quality:draft.jpeg_quality, clipboard_sync:!!draft.clipboard_sync,theme:draft.theme || "light",refresh_interval:draft.interval,screen_fit:draft.fit,view_only:draft.viewOnly };
+    const next={ machine_name:draft.machine_name, jpeg_quality:draft.jpeg_quality, clipboard_sync:!!draft.clipboard_sync,theme:draft.theme || "light",refresh_interval:draft.interval,screen_fit:draft.fit,view_only:draft.viewOnly,registration_host:draft.registration_host?.trim() || 'functions3.ultraviewer.net',tls_server_name:draft.tls_server_name?.trim() || 'ultraviewer',socks5_enabled:!!draft.socks5_enabled,socks5_host:draft.socks5_host?.trim() || '',socks5_port:draft.socks5_port || 1080,socks5_username:draft.socks5_username || '',socks5_password:draft.socks5_password || '' };
     await post('/settings',next); setSettings(next);
     const local={ interval:draft.interval, fit:draft.fit, viewOnly:draft.viewOnly };
     setDisplay(local); setNotice('Đã lưu cài đặt');

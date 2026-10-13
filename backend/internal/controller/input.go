@@ -1,5 +1,3 @@
-// ASCII input commands recovered from RC40 e3a and b66 (E56–E59).
-// Coordinates are remote desktop pixels; keys are Windows virtual-key codes.
 package controller
 
 import (
@@ -48,7 +46,7 @@ func mouseWheel(delta int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// b6a extracts the signed high word of the original packed wParam.
+
 	n, _ := strconv.Atoi(s)
 	return []byte("8|||522|||" + strconv.Itoa(n<<16)), nil
 }

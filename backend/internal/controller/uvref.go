@@ -1,6 +1,3 @@
-// Portable protocol models recovered from UltraViewer 6.6.133.
-// Go port of uv_reference.py: only valid, non-overlapping buffers are modeled;
-// malformed input returns an error rather than being silently accepted.
 package controller
 
 import (
@@ -17,10 +14,6 @@ import (
 	"golang.org/x/text/encoding/charmap"
 )
 
-// ---- ANSI (Windows code page) helpers ------------------------------------
-
-// ansiEncode encodes a string with the given ANSI codec (only cp1252 is used by
-// the shipped profiles). Unmappable runes are rejected, matching errors="strict".
 func ansiEncode(s, codec string) ([]byte, error) {
 	switch strings.ToLower(codec) {
 	case "cp1252", "windows-1252":
@@ -32,7 +25,6 @@ func ansiEncode(s, codec string) ([]byte, error) {
 	}
 }
 
-// ansiDecode decodes ANSI bytes to a string (strict).
 func ansiDecode(b []byte, codec string) (string, error) {
 	switch strings.ToLower(codec) {
 	case "cp1252", "windows-1252":
@@ -46,7 +38,6 @@ func ansiDecode(b []byte, codec string) (string, error) {
 	}
 }
 
-// utf16le encodes a string as UTF-16LE with no BOM, like Windows BSTR bytes.
 func utf16le(s string) []byte {
 	out := make([]byte, 0, len(s)*2)
 	for _, r := range utf16Units(s) {
@@ -57,7 +48,6 @@ func utf16le(s string) []byte {
 	return out
 }
 
-// utf16Units returns the UTF-16 code units for a string.
 func utf16Units(s string) []uint16 {
 	units := make([]uint16, 0, len(s))
 	for _, r := range s {
@@ -71,9 +61,6 @@ func utf16Units(s string) []uint16 {
 	return units
 }
 
-// ---- byte-array field framing (R200) -------------------------------------
-
-// encodeByteArrayFields lays out each field as LE uint32 length + value.
 func encodeByteArrayFields(fields [][]byte) []byte {
 	out := make([]byte, 0)
 	var l [4]byte
@@ -85,7 +72,6 @@ func encodeByteArrayFields(fields [][]byte) []byte {
 	return out
 }
 
-// decodeByteArrayFields parses a complete field payload; truncation is rejected.
 func decodeByteArrayFields(payload []byte) ([][]byte, error) {
 	fields := [][]byte{}
 	off := 0
@@ -106,9 +92,6 @@ func decodeByteArrayFields(payload []byte) ([][]byte, error) {
 	return fields, nil
 }
 
-// ---- transport framing ---------------------------------------------------
-
-// encodeTransportFrame prepends an Int32 LE length to the body (E119/e31).
 func encodeTransportFrame(body []byte) ([]byte, error) {
 	if len(body) > 0x7fffffff-4 {
 		return nil, errors.New("frame exceeds checked managed allocation size")
@@ -119,9 +102,6 @@ func encodeTransportFrame(body []byte) ([]byte, error) {
 	return out, nil
 }
 
-// encodeRelayFrame builds the mode0 relay frame (RC40 de1): [0, flag, addr, port]
-// + payload, then length-prefixed. The IPv4 value is a big-endian integer stored
-// little-endian, exactly reproducing struct.pack("<BBIH", 0, flag, address, port).
 func encodeRelayFrame(payload []byte, ipv4 string, port, flag int) ([]byte, error) {
 	parts := strings.Split(ipv4, ".")
 	if len(parts) != 4 {
@@ -153,17 +133,14 @@ func encodeRelayFrame(payload []byte, ipv4 string, port, flag int) ([]byte, erro
 	return encodeTransportFrame(append(head, payload...))
 }
 
-// transportPacket is the decoded e37 transport dispatch result.
 type transportPacket struct {
-	kind         string // "relay" or "direct"
+	kind         string
 	flag         bool
 	addressValue uint32
 	port         uint16
 	data         []byte
 }
 
-// decodeTransportBody decodes the transport dispatch header; nil result + nil
-// error means an unknown kind (mirrors the Python None return).
 func decodeTransportBody(body []byte) (*transportPacket, error) {
 	if len(body) == 0 {
 		return nil, errors.New("empty transport body")
@@ -186,10 +163,6 @@ func decodeTransportBody(body []byte) (*transportPacket, error) {
 	return nil, nil
 }
 
-// ---- crypto (registration TripleDES) -------------------------------------
-
-// deriveVFunctionKeyBytes = SHA1(UTF16LE(password)) resized by zero extension or
-// truncation (RC40 1485).
 func deriveVFunctionKeyBytes(password string, length int) []byte {
 	sum := sha1.Sum(utf16le(password))
 	out := make([]byte, length)
@@ -197,7 +170,6 @@ func deriveVFunctionKeyBytes(password string, length int) []byte {
 	return out
 }
 
-// registrationPassword = startup VFunction key (E124): chr(5,10,15,20,25).
 var registrationPassword = string([]byte{5, 10, 15, 20, 25})
 
 func pkcs7Pad(data []byte, block int) []byte {
@@ -225,7 +197,6 @@ func pkcs7Unpad(data []byte, block int) ([]byte, error) {
 	return data[:len(data)-n], nil
 }
 
-// encryptRegistrationBytes applies .NET TripleDES/CBC/PKCS7 defaults (RC40 1486).
 func encryptRegistrationBytes(payload []byte) ([]byte, error) {
 	key := deriveVFunctionKeyBytes(registrationPassword, 24)
 	iv := deriveVFunctionKeyBytes("", 8)
@@ -239,10 +210,6 @@ func encryptRegistrationBytes(payload []byte) ([]byte, error) {
 	return out, nil
 }
 
-// ---- HTTP tunnel preface -------------------------------------------------
-
-// httpServicePreface builds the recovered Windows HTTP tunnel preface (e25/e24).
-// The content length is copied from the artifact, not calculated.
 func httpServicePreface(host string) []byte {
 	lines := []string{
 		"POST /UVService/ HTTP/1.1",
@@ -255,8 +222,6 @@ func httpServicePreface(host string) []byte {
 	}
 	return []byte(strings.Join(lines, "\r\n") + "\r\n")
 }
-
-// ---- command 3 identity --------------------------------------------------
 
 type command3Identity struct {
 	clientID         int
@@ -287,7 +252,6 @@ func isDecimal(s string) bool {
 	return true
 }
 
-// extractCommand3Identity parses the identity/endpoint subset of command 3 (E131).
 func extractCommand3Identity(payload []byte, codec string) (command3Identity, error) {
 	var id command3Identity
 	fields, err := decodeCommandFields(payload, codec)
@@ -312,10 +276,6 @@ func extractCommand3Identity(payload []byte, codec string) (command3Identity, er
 	return command3Identity{clientID: idNumber, publicSourcePort: portNumber, publicIP: fields[3]}, nil
 }
 
-// ---- command builders ----------------------------------------------------
-
-// buildRegistrationCommand validates and joins the 26-term InitMyPassword
-// command (E147).
 func buildRegistrationCommand(terms []string, codec string) ([]byte, error) {
 	if len(terms) != 26 {
 		return nil, errors.New("registration requires exactly 26 string terms")
@@ -333,6 +293,15 @@ func buildRegistrationCommand(terms []string, codec string) ([]byte, error) {
 			return nil, fmt.Errorf("unsupported delimiter or NUL in term %d", i)
 		}
 	}
+	metadata := strings.Split(terms[10], "|")
+	if len(metadata) != 6 {
+		return nil, errors.New("term 10 requires six unsigned decimal metadata fields")
+	}
+	for _, value := range metadata {
+		if !isDecimal(value) {
+			return nil, errors.New("term 10 requires six unsigned decimal metadata fields")
+		}
+	}
 	ticks := strings.Split(terms[22], ":")
 	if len(ticks) != 3 {
 		return nil, errors.New("term 22 requires three unsigned decimal tick strings")
@@ -345,8 +314,6 @@ func buildRegistrationCommand(terms []string, codec string) ([]byte, error) {
 	return ansiEncode(strings.Join(terms, ":"), codec)
 }
 
-// connectionRequestPasswordValue: type 0 hashes ANSI(32 spaces + password) as
-// lowercase MD5 hex; other types reuse the string (0x6edc60, E162).
 func connectionRequestPasswordValue(password string, passwordType int, codec string) (string, error) {
 	if passwordType == 0 {
 		b, err := ansiEncode(strings.Repeat(" ", 32)+password, codec)
@@ -358,7 +325,6 @@ func connectionRequestPasswordValue(password string, passwordType int, codec str
 	return password, nil
 }
 
-// buildConnectionRequestCommand joins the 17 explicit command8 terms (E163/E165).
 func buildConnectionRequestCommand(terms []string, codec string) ([]byte, error) {
 	if len(terms) != 17 {
 		return nil, errors.New("command8 requires 17 string terms")
@@ -374,7 +340,6 @@ func buildConnectionRequestCommand(terms []string, codec string) ([]byte, error)
 	return ansiEncode(strings.Join(terms, ":"), codec)
 }
 
-// loginNumericSaltDigest: type0 Login MD5(ANSI(eight-digit salt + password)).
 func loginNumericSaltDigest(password, salt, codec string) (string, error) {
 	if len(salt) != 8 || !isDecimal(salt) {
 		return "", errors.New("Login salt must contain eight ASCII digits")
@@ -392,7 +357,6 @@ type loginPasswordFields struct {
 	secondary string
 }
 
-// computeLoginPasswordFields reproduces login 6d6f3a..6d726e (R191).
 func computeLoginPasswordFields(password string, passwordType int, salt, codec string) (loginPasswordFields, error) {
 	var lf loginPasswordFields
 	if passwordType == 0 {
@@ -412,7 +376,6 @@ func computeLoginPasswordFields(password string, passwordType int, salt, codec s
 	return loginPasswordFields{salt: strings.Repeat(" ", 32), primary: password, secondary: password}, nil
 }
 
-// buildLoginCommand: "login:" + 22 preformatted fields, raw BSTR UTF16LE (E185).
 func buildLoginCommand(fields []string) ([]byte, error) {
 	if len(fields) != 22 {
 		return nil, errors.New("login requires exactly 22 fields after its prefix")
@@ -425,8 +388,6 @@ func buildLoginCommand(fields []string) ([]byte, error) {
 	return utf16le("login:" + strings.Join(fields, ":")), nil
 }
 
-// buildLoginWithPassword fills the sensitive login positions (0, 1, 12) in a
-// caller-supplied 22-field schema; the input slice is not mutated.
 func buildLoginWithPassword(fields []string, password string, passwordType int, salt, codec string) ([]byte, error) {
 	if len(fields) != 22 {
 		return nil, errors.New("login requires exactly 22 fields after its prefix")
@@ -440,13 +401,10 @@ func buildLoginWithPassword(fields []string, password string, passwordType int, 
 	return buildLoginCommand(values)
 }
 
-// ---- JPEG atlas tile layout ----------------------------------------------
-
 type atlasTile struct {
 	x, y, w, h, sx, sy int
 }
 
-// atlasLayout yields tiles in observed order (screen_x,screen_y,w,h,atlas_x,atlas_y).
 func atlasLayout(rectangles [][4]int, blockSize, atlasHeight int) ([]atlasTile, error) {
 	if blockSize <= 0 || atlasHeight <= 0 {
 		return nil, errors.New("invalid atlas geometry")

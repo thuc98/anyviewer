@@ -2,28 +2,19 @@ package main
 
 import (
 	"anyviewer-go/internal/controller"
+	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"syscall"
 )
 
-func configPath() string {
-	exe, _ := os.Executable()
-	cwd, _ := os.Getwd()
-	for _, base := range []string{filepath.Dir(exe), filepath.Join(filepath.Dir(exe), ".."), cwd, filepath.Join(cwd, "..")} {
-		path := filepath.Join(base, "config", "controller-config.json")
-		if info, err := os.Stat(path); err == nil && !info.IsDir() {
-			return path
-		}
-	}
-	return filepath.Join("config", "controller-config.json")
-}
 func openBrowser(url string) {
 	var command string
 	var args []string
@@ -38,7 +29,8 @@ func openBrowser(url string) {
 	_ = exec.Command(command, args...).Start()
 }
 func main() {
-	config := flag.String("registration", configPath(), "controller registration/settings JSON")
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	config := flag.String("registration", "", "optional controller config override (default generated)")
 	dictionary := flag.String("dictionary", "", "optional Zstandard dictionary override (default embedded)")
 	host := flag.String("host", "127.0.0.1", "listen host")
 	port := flag.Int("port", 8765, "listen port (0 = free port)")
@@ -56,7 +48,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "cannot initialize controller: %v\n", err)
 		os.Exit(1)
 	}
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", *host, *port))
+	listener, err := net.Listen("tcp", net.JoinHostPort(*host, fmt.Sprint(*port)))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot listen: %v\n", err)
 		os.Exit(1)
@@ -66,14 +58,21 @@ func main() {
 		urlHost = "127.0.0.1"
 	}
 	url := "http://" + net.JoinHostPort(urlHost, fmt.Sprint(listener.Addr().(*net.TCPAddr).Port))
+	log.Printf("event=webserver status=listening address=%q", listener.Addr())
 	fmt.Printf("AnyViewer Web running on %s\n", url)
 	if *open {
 		openBrowser(url)
 	}
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	go func() { <-sig; listener.Close() }()
-	if err := server.Serve(listener); err != nil && !os.IsNotExist(err) {
-		server.Shutdown()
+	go func() {
+		received := <-sig
+		log.Printf("event=webserver status=stopping signal=%q", received)
+		listener.Close()
+	}()
+	if err := server.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+		fmt.Fprintf(os.Stderr, "server stopped: %v\n", err)
+		os.Exit(1)
 	}
+	log.Printf("event=webserver status=stopped")
 }
