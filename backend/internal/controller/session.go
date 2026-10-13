@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/rand"
 	"errors"
@@ -59,6 +60,18 @@ type controlSession struct {
 }
 
 var connectionSequence atomic.Uint64
+
+const partnerRouteTimeout = 30 * time.Second
+
+func firstField(payload []byte) string {
+	if i := bytes.IndexByte(payload, ':'); i >= 0 && i < 8 {
+		return string(payload[:i])
+	}
+	if len(payload) > 8 {
+		payload = payload[:8]
+	}
+	return fmt.Sprintf("%x", payload)
+}
 
 func (s *controlSession) logf(format string, args ...any) {
 	log.Printf("connection=%s %s", s.logID, fmt.Sprintf(format, args...))
@@ -150,12 +163,15 @@ func (s *controlSession) connect(reg registrationProfile, partner partnerProfile
 	}
 
 	stage = "receive partner route"
-	s.logf("event=partner_route status=waiting")
+	s.logf("event=partner_route status=waiting timeout=%s", partnerRouteTimeout)
+	s.registration.timeout = partnerRouteTimeout
+	defer func(d time.Duration) { s.registration.timeout = d }(s.timeout)
 	for i := 0; i < 4; i++ {
 		response, rerr := s.registration.receiveMode1Payload()
 		if rerr != nil {
 			return rerr
 		}
+		s.logf("event=partner_route status=frame index=%d prefix=%q", i, firstField(response))
 		if strings.HasPrefix(string(response), "8:") {
 			text, derr := ansiDecode(response, s.codec)
 			if derr != nil {

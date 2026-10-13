@@ -18,7 +18,7 @@ import (
 
 const (
 	defaultRegHost = "functions3.ultraviewer.net"
-	tlsTargetHost  = "ultraviewer"
+	tlsTargetHost  = defaultRegHost
 )
 
 var errTimeout = errors.New("transport deadline")
@@ -115,7 +115,30 @@ func (t *transport) connectRegistration(host string, port int) error {
 	if t.conn != nil {
 		return errors.New("already connected")
 	}
-	raw, err := t.dial(host, port)
+	addrs := []string{host}
+	if !t.settings.SOCKS5Enabled && net.ParseIP(host) == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), t.timeout)
+		ips, err := net.DefaultResolver.LookupHost(ctx, host)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("resolve %s: %w", host, err)
+		}
+		addrs = ips
+	}
+	var err error
+	for i, addr := range addrs {
+		if err = t.connectRegistrationAddr(addr, host, port); err == nil {
+			return nil
+		}
+		if i < len(addrs)-1 {
+			t.logf("event=registration_address status=failed address=%q error=%q next=%q", addr, err, addrs[i+1])
+		}
+	}
+	return err
+}
+
+func (t *transport) connectRegistrationAddr(addr, host string, port int) error {
+	raw, err := t.dial(addr, port)
 	if err != nil {
 		return fmt.Errorf("TCP dial: %w", err)
 	}
