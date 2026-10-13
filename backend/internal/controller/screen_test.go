@@ -88,3 +88,58 @@ func TestScreenFailedExpansionIsAtomic(t *testing.T) {
 		}
 	}
 }
+
+func TestScreenStagesPatchesBeforeCommitAndTracksDirty(t *testing.T) {
+	screen, err := newRGB555Screen(64, 64, nil, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tile := newCanvas(2, 2)
+	tile.SetRGBA(0, 0, color.RGBA{R: 255, A: 255})
+	screen.cache.add(123, tile)
+	fields := make([][]byte, 11)
+	fields[0] = []byte{1}
+	fields[9] = make([]byte, 8)
+	binary.LittleEndian.PutUint16(fields[9], 10)
+	binary.LittleEndian.PutUint16(fields[9][2:], 20)
+	binary.LittleEndian.PutUint32(fields[9][4:], 123)
+	fields[7] = []byte("invalid JPEG")
+	before := screen.canvas
+	if _, err = screen.apply(fields); err == nil {
+		t.Fatal("invalid trailing operation accepted")
+	}
+	if screen.canvas != before || screen.canvas.RGBAAt(10, 20).R != 0 {
+		t.Fatal("staged cache patch committed before validation")
+	}
+	fields[7] = nil
+	if _, err = screen.apply(fields); err != nil {
+		t.Fatal(err)
+	}
+	if screen.canvas != before {
+		t.Fatal("small update cloned full canvas")
+	}
+	if screen.dirty != image.Rect(10, 20, 12, 22) || screen.canvas.RGBAAt(10, 20).R != 255 {
+		t.Fatal("dirty rectangle or in-place update incorrect")
+	}
+}
+
+func TestScreenScrollCopiesOnlySourceRegion(t *testing.T) {
+	screen, err := newRGB555Screen(64, 64, nil, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	screen.canvas.SetRGBA(10, 20, color.RGBA{G: 255, A: 255})
+	fields := make([][]byte, 11)
+	fields[0] = []byte{1}
+	fields[6] = make([]byte, 10)
+	binary.LittleEndian.PutUint16(fields[6], 5)
+	copy(fields[6][2:], screenRectangle(10, 20, 2, 2))
+	fields[6] = append(fields[6], screenRectangle(10, 15, 2, 2)...)
+	before := screen.canvas
+	if _, err = screen.apply(fields); err != nil {
+		t.Fatal(err)
+	}
+	if screen.canvas != before || screen.dirty != image.Rect(10, 15, 12, 17) || screen.canvas.RGBAAt(10, 15).G != 255 {
+		t.Fatal("scroll patch wrong or canvas copied")
+	}
+}

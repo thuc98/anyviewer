@@ -151,3 +151,56 @@ func TestRegistrationRejectsInvalidMetadata(t *testing.T) {
 		}
 	}
 }
+
+func TestBootstrapResumesConnectedSessionAndExpiresAfterOneMinute(t *testing.T) {
+	server := testManager()
+	defer server.Shutdown()
+	handler := server.Handler()
+	id := bootstrapSession(t, handler)
+	viewer := server.sessions[id].viewer
+	viewer.state = viewerState{State: "connected", PartnerID: "123456789", Frames: 10}
+	viewer.frame = []byte("existing frame")
+	response := managerRequest(handler, "GET", "/bootstrap", id, "")
+	var resumed struct {
+		Session string `json:"session"`
+		Resumed bool   `json:"resumed"`
+	}
+	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &resumed) != nil || !resumed.Resumed || resumed.Session != id {
+		t.Fatal("reload created a new session")
+	}
+	if len(server.sessions) != 1 || server.sessions[id].viewer != viewer {
+		t.Fatal("connected viewer replaced")
+	}
+	if response = managerRequest(handler, "GET", "/frame.png", id, ""); response.Body.String() != "existing frame" {
+		t.Fatal("resumed session lost frame")
+	}
+	server.sessions[id].lastSeen = time.Now().Add(-59 * time.Second)
+	server.expireSessions(time.Now())
+	if server.sessions[id] == nil {
+		t.Fatal("session expired before one minute")
+	}
+	server.sessions[id].lastSeen = time.Now().Add(-61 * time.Second)
+	response = managerRequest(handler, "GET", "/bootstrap", id, "")
+	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &resumed) != nil || resumed.Resumed || resumed.Session == id {
+		t.Fatal("expired session was revived")
+	}
+	server.cleanup.Wait()
+	if !viewer.closing {
+		t.Fatal("expired viewer not shut down")
+	}
+}
+
+func TestBootstrapResumeRequiresToken(t *testing.T) {
+	server := testManager()
+	defer server.Shutdown()
+	id := bootstrapSession(t, server.Handler())
+	req := httptest.NewRequest("GET", "/bootstrap", nil)
+	req.Host = "127.0.0.1:8765"
+	req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey, &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8765}))
+	req.Header.Set("X-Viewer-Session", id)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, req)
+	if response.Code != 403 {
+		t.Fatal("resumed without authorization")
+	}
+}

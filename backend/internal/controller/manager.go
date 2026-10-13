@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -103,6 +104,11 @@ func validHost(r *http.Request) bool {
 	if r.Host == addr.String() {
 		return true
 	}
+	for _, host := range strings.Split(os.Getenv("VIEWER_ALLOWED_HOSTS"), ",") {
+		if host = strings.TrimSpace(host); host != "" && r.Host == host {
+			return true
+		}
+	}
 	host, port, err := net.SplitHostPort(addr.String())
 	return err == nil && net.ParseIP(host).IsLoopback() && r.Host == net.JoinHostPort("localhost", port)
 }
@@ -126,6 +132,15 @@ func (s *Server) createSession() (string, *tabSession, error) {
 	viewer.onSettings = func(settings viewerSettings) { s.base.mu.Lock(); s.base.settings = settings; s.base.mu.Unlock() }
 	session := &tabSession{viewer: viewer, handler: viewer.handler(webui.Index, s.token), lastSeen: time.Now()}
 	s.sessions[id] = session
+	viewer.onHeartbeat = func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.closed || s.sessions[id] != session || time.Since(session.lastSeen) >= time.Minute {
+			return false
+		}
+		session.lastSeen = time.Now()
+		return true
+	}
 	return id, session, nil
 }
 func (s *Server) Handler() http.Handler {
@@ -140,14 +155,41 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		if r.Method == "GET" && r.URL.Path == "/bootstrap" {
-			id, session, err := s.createSession()
-			if err != nil {
-				reply(w, 503, []byte(`{"error":"cannot create session"}`), "application/json")
-				return
+			s.expireSessions(time.Now())
+			id := r.Header.Get("X-Viewer-Session")
+			var session *tabSession
+			if id != "" {
+				if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Viewer-Token")), []byte(s.token)) != 1 {
+					reply(w, 403, []byte("{}"), "application/json")
+					return
+				}
+				s.mu.Lock()
+				session = s.sessions[id]
+				if session != nil {
+					session.lastSeen = time.Now()
+				}
+				s.mu.Unlock()
 			}
-			data, _ := json.Marshal(map[string]interface{}{"token": s.token, "session": id, "settings": session.viewer.settings})
+			resumed := session != nil
+			if session == nil {
+				var err error
+				id, session, err = s.createSession()
+				if err != nil {
+					reply(w, 503, []byte(`{"error":"cannot create session"}`), "application/json")
+					return
+				}
+			}
+			session.viewer.mu.Lock()
+			settings := session.viewer.settings
+			session.viewer.mu.Unlock()
+			data, _ := json.Marshal(map[string]interface{}{"token": s.token, "session": id, "settings": settings, "resumed": resumed})
 			reply(w, 200, data, "application/json")
 			return
+		}
+		if r.Method == "GET" && (r.URL.Path == "/stream/ws" || r.URL.Path == "/stream/control") {
+			credentials := streamCredentials(r)
+			r.Header.Set("X-Viewer-Token", credentials[0])
+			r.Header.Set("X-Viewer-Session", credentials[1])
 		}
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Viewer-Token")), []byte(s.token)) != 1 {
 			reply(w, 403, []byte("{}"), "application/json")
@@ -158,6 +200,7 @@ func (s *Server) Handler() http.Handler {
 			reply(w, 403, []byte("{}"), "application/json")
 			return
 		}
+		s.expireSessions(time.Now())
 		id := r.Header.Get("X-Viewer-Session")
 		s.mu.Lock()
 		session := s.sessions[id]
@@ -188,7 +231,7 @@ func (s *Server) expireSessions(now time.Time) {
 		return
 	}
 	for id, session := range s.sessions {
-		if now.Sub(session.lastSeen) > 5*time.Minute {
+		if now.Sub(session.lastSeen) >= time.Minute {
 			delete(s.sessions, id)
 			expired = append(expired, session.viewer)
 			s.cleanup.Add(1)
@@ -221,7 +264,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	server := &http.Server{Handler: s.Handler()}
 	stop := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
 			select {

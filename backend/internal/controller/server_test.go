@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -114,3 +115,63 @@ func TestNormalizePartnerID(t *testing.T) {
 }
 
 func stringPointer(value string) *string { return &value }
+
+func TestDisconnectResponseWaitsUntilRemoteSocketCloses(t *testing.T) {
+	v := newViewer(registrationProfile{}, nil, 1, 1, 32, true)
+	v.curStop = make(chan struct{})
+	v.curDone = make(chan struct{})
+	v.curStopOnce = &sync.Once{}
+	local, remote := net.Pipe()
+	defer remote.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	relay := newTransport(30*time.Second, true)
+	relay.ctx = ctx
+	relay.conn = local
+	relay.watchConnection(local)
+	go func() {
+		<-v.curStop
+		cancel()
+		relay.Close()
+		v.mu.Lock()
+		v.state.State = "disconnected"
+		v.mu.Unlock()
+		close(v.curDone)
+	}()
+	request := httptest.NewRequest("POST", "/disconnect", strings.NewReader("{}"))
+	request.Host = "127.0.0.1:8765"
+	request = request.WithContext(context.WithValue(request.Context(), http.LocalAddrContextKey, &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8765}))
+	request.Header.Set("X-Viewer-Token", "fixture-token")
+	response := httptest.NewRecorder()
+	v.handler(nil, "fixture-token").ServeHTTP(response, request)
+	if response.Code != 200 || v.state.State != "disconnected" {
+		t.Fatal("disconnect returned before cleanup")
+	}
+	remote.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := remote.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("remote connection still open: %v", err)
+	}
+}
+
+func TestCancellationInterruptsPendingTransportRead(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	transport := newTransport(30*time.Second, true)
+	transport.ctx = ctx
+	transport.conn = local
+	transport.watchConnection(local)
+	done := make(chan error, 1)
+	go func() { _, err := transport.receiveBody(); done <- err }()
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("canceled read succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("disconnect did not interrupt blocking read")
+	}
+	transport.Close()
+}

@@ -12,6 +12,13 @@ import (
 )
 
 type viewerSettings struct {
+	StreamAdaptive   bool   `json:"stream_adaptive"`
+	StreamBitrate    int    `json:"stream_bitrate"`
+	StreamTransport  string `json:"stream_transport"`
+	StreamEncoding   string `json:"stream_encoding"`
+	StreamQuality    int    `json:"stream_quality"`
+	StreamFPS        int    `json:"stream_fps"`
+	StreamDirty      bool   `json:"stream_dirty"`
 	MachineName      string `json:"machine_name"`
 	JPEGQuality      int    `json:"jpeg_quality"`
 	ClipboardSync    bool   `json:"clipboard_sync"`
@@ -30,9 +37,24 @@ type viewerSettings struct {
 
 func defaultViewerSettings() viewerSettings {
 	name, _ := os.Hostname()
-	return viewerSettings{MachineName: name, JPEGQuality: 30, Theme: "light", RefreshInterval: 500, ScreenFit: true, RegistrationHost: defaultRegHost, TLSServerName: tlsTargetHost, SOCKS5Port: 1080}
+	return viewerSettings{StreamAdaptive: true, StreamBitrate: 10000, StreamTransport: "websocket", StreamEncoding: "jpeg", StreamQuality: 75, StreamFPS: 30, StreamDirty: true, MachineName: name, JPEGQuality: 30, Theme: "light", RefreshInterval: 500, ScreenFit: true, RegistrationHost: defaultRegHost, TLSServerName: tlsTargetHost, SOCKS5Port: 1080}
 }
 func (s *viewerSettings) normalize() {
+	if s.StreamBitrate == 0 {
+		s.StreamBitrate = 10000
+	}
+	if s.StreamTransport == "" {
+		s.StreamTransport = "websocket"
+	}
+	if s.StreamEncoding == "" {
+		s.StreamEncoding = "jpeg"
+	}
+	if s.StreamQuality == 0 {
+		s.StreamQuality = 75
+	}
+	if s.StreamFPS == 0 {
+		s.StreamFPS = 30
+	}
 	s.RegistrationHost = strings.TrimSpace(s.RegistrationHost)
 	s.TLSServerName = strings.TrimSpace(s.TLSServerName)
 	s.SOCKS5Host = strings.TrimSpace(s.SOCKS5Host)
@@ -53,6 +75,24 @@ func (s *viewerSettings) normalize() {
 	}
 }
 func (s viewerSettings) validate() error {
+	if s.StreamBitrate < 100 || s.StreamBitrate > 50000 {
+		return errors.New("stream bitrate must be between 100 and 50000 kbps")
+	}
+	if s.StreamEncoding == "vp8" && s.StreamTransport != "webrtc" {
+		return errors.New("VP8 requires WebRTC transport")
+	}
+	if s.StreamTransport != "polling" && s.StreamTransport != "websocket" && s.StreamTransport != "webrtc" {
+		return errors.New("unsupported stream transport")
+	}
+	if s.StreamEncoding != "png" && s.StreamEncoding != "jpeg" && s.StreamEncoding != "vp8" {
+		return errors.New("unsupported stream encoding")
+	}
+	if s.StreamQuality < 1 || s.StreamQuality > 100 {
+		return errors.New("stream quality must be between 1 and 100")
+	}
+	if s.StreamFPS < 1 || s.StreamFPS > 60 {
+		return errors.New("stream FPS must be between 1 and 60")
+	}
 	if !validNetworkHost(s.RegistrationHost) || !validNetworkHost(s.TLSServerName) {
 		return errors.New("registration host and TLS server name must be hostnames or IP addresses without a scheme or port")
 	}

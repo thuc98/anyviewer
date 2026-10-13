@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { getClipboard, post } from './api';
+import { errorMessage } from './errors';
 
 export function useClipboard(connected, enabled, viewOnly) {
   const [error, setError] = useState('');
@@ -19,17 +20,17 @@ export function useClipboard(connected, enabled, viewOnly) {
     if (sending.current) return sending.current;
     sending.current = (async () => {
       try {
-        if (!navigator.clipboard?.readText) throw new Error('Trình duyệt chưa hỗ trợ clipboard. Dùng localhost hoặc HTTPS.');
+        if (!navigator.clipboard?.readText) throw new Error('Trình duyệt chưa hỗ trợ bộ nhớ tạm. Dùng localhost hoặc HTTPS.');
         const text = await navigator.clipboard.readText();
         if (!active.current) return false;
         canRead.current = true;
-        if (!text) { if(!quiet) setError('Clipboard không có văn bản.'); return false; }
-        if (new TextEncoder().encode(text).length > 128*1024 || text.length*2 > 64*1024) throw new Error('Clipboard vượt quá 64 KB văn bản.');
+        if (!text) { if(!quiet) setError('bộ nhớ tạm không có văn bản.'); return false; }
+        if (new TextEncoder().encode(text).length > 128*1024 || text.length*2 > 64*1024) throw new Error('bộ nhớ tạm vượt quá 64 KB văn bản.');
         if (text !== lastText.current) { await post('/clipboard',{ text }); lastText.current = text; }
         setError(''); return true;
       } catch (e) {
         canRead.current = false;
-        setError(e.name === 'NotAllowedError' ? 'Cho phép clipboard hoặc dùng nút Gửi/Nhận clipboard.' : e.message);
+        setError(e.name === 'NotAllowedError' ? 'Cho phép bộ nhớ tạm hoặc dùng nút Gửi/Nhận bộ nhớ tạm.' : errorMessage(e));
         return false;
       } finally { sending.current = null; }
     })();
@@ -38,14 +39,14 @@ export function useClipboard(connected, enabled, viewOnly) {
   async function receiveFromRemote() {
     if (!active.current || !remote.current.version) return false;
     try {
-      if (!navigator.clipboard?.writeText) throw new Error('Trình duyệt chưa hỗ trợ clipboard. Dùng localhost hoặc HTTPS.');
+      if (!navigator.clipboard?.writeText) throw new Error('Trình duyệt chưa hỗ trợ bộ nhớ tạm. Dùng localhost hoặc HTTPS.');
       const latest = remote.current;
       await navigator.clipboard.writeText(latest.text);
       lastText.current = latest.text; applied.current = latest.version;
       setPending(false); setError(''); return true;
     } catch (e) {
       setPending(true);
-      setError(e.name === 'NotAllowedError' ? 'Nhấn Nhận clipboard để sao chép văn bản từ đối tác.' : e.message);
+      setError(e.name === 'NotAllowedError' ? 'Nhấn Nhận bộ nhớ tạm để sao chép văn bản từ đối tác.' : errorMessage(e));
       return false;
     }
   }
@@ -64,7 +65,7 @@ export function useClipboard(connected, enabled, viewOnly) {
         if (!document.hidden && document.hasFocus()) {
           const value = await getClipboard(AbortSignal.any([abort.signal,AbortSignal.timeout(3000)]));
           if (stopped) return;
-          if (value.error) setError(value.error);
+          if (value.error) setError(errorMessage(value.error));
           if (value.version && value.version !== remote.current.version) { remote.current=value; setPending(true); }
           if (remote.current.version && remote.current.version !== applied.current) {
 
@@ -73,7 +74,7 @@ export function useClipboard(connected, enabled, viewOnly) {
 
           if (allowSend.current && canRead.current && (!remote.current.version || applied.current === remote.current.version)) await actions.current.sendFromLocal({quiet:true});
         }
-      } catch (e) { if (!stopped && e.name !== 'AbortError') setError('Không thể đồng bộ clipboard.'); }
+      } catch (e) { if (!stopped && e.name !== 'AbortError') setError('Không thể đồng bộ bộ nhớ tạm.'); }
       finally { if (!stopped) timer=setTimeout(tick,1000); }
     }
     tick();

@@ -1,0 +1,11 @@
+.git
+.DS_Store
+.env
+.env.*
+frontend/node_modules
+backend/internal/webui/dist
+backend/internal/controller/private
+config
+bin
+*.log
+*.png

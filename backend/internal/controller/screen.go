@@ -58,24 +58,11 @@ func cloneCanvas(src *image.RGBA) *image.RGBA {
 }
 
 func pasteImage(dst, src *image.RGBA, dx, dy int) {
-	sw := src.Rect.Dx()
-	sh := src.Rect.Dy()
-	dw := dst.Rect.Dx()
-	dh := dst.Rect.Dy()
-	for sy := 0; sy < sh; sy++ {
-		ty := dy + sy
-		if ty < 0 || ty >= dh {
-			continue
-		}
-		for sx := 0; sx < sw; sx++ {
-			tx := dx + sx
-			if tx < 0 || tx >= dw {
-				continue
-			}
-			si := src.PixOffset(src.Rect.Min.X+sx, src.Rect.Min.Y+sy)
-			di := dst.PixOffset(tx, ty)
-			copy(dst.Pix[di:di+4], src.Pix[si:si+4])
-		}
+	rect := image.Rect(dx, dy, dx+src.Rect.Dx(), dy+src.Rect.Dy()).Intersect(dst.Rect)
+	for y := rect.Min.Y; y < rect.Max.Y; y++ {
+		si := src.PixOffset(src.Rect.Min.X+rect.Min.X-dx, src.Rect.Min.Y+y-dy)
+		di := dst.PixOffset(rect.Min.X, y)
+		copy(dst.Pix[di:di+rect.Dx()*4], src.Pix[si:si+rect.Dx()*4])
 	}
 }
 
@@ -143,7 +130,13 @@ func (c *tileCache) trim() {
 	}
 }
 
+type screenPatch struct {
+	rect   image.Rectangle
+	pixels *image.RGBA
+}
+
 type rgb555Screen struct {
+	dirty     image.Rectangle
 	canvas    *image.RGBA
 	decoder   *zstdDictDecoder
 	cache     *tileCache
@@ -257,12 +250,13 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 	s.width, s.height = width, height
 	var canvas *image.RGBA
 	if width == s.canvas.Rect.Dx() && height == s.canvas.Rect.Dy() {
-		canvas = cloneCanvas(s.canvas)
+		canvas = s.canvas
 	} else {
 		canvas = newCanvas(width, height)
 		pasteImage(canvas, s.canvas, 0, 0)
 	}
 	cache := s.cache.clone()
+	var patches []screenPatch
 	count := 0
 
 	if len(fields[6]) != 0 {
@@ -278,8 +272,7 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 			return 0, err
 		}
 
-		shifted := newCanvas(s.width, s.height)
-		pasteImage(shifted, cropImage(canvas, x, y, w, h), x, y-delta)
+		shifted := cropImage(canvas, x, y, w, h)
 		rest := fields[6][10:]
 		for off := 0; off < len(rest); off += 8 {
 			rx := i16(rest[off : off+2])
@@ -292,7 +285,7 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 			if rx < x || rx+rw > x+w || ry < y-delta || ry+rh > y-delta+h {
 				return 0, errors.New("scroll-copy references uncopied intermediate pixels")
 			}
-			pasteImage(canvas, cropImage(shifted, rx, ry, rw, rh), rx, ry)
+			patches = append(patches, screenPatch{image.Rect(rx, ry, rx+rw, ry+rh), cropImage(shifted, rx-x, ry-(y-delta), rw, rh)})
 			count++
 		}
 	}
@@ -308,7 +301,7 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 		if err := s.bounds(x, y, tile.Rect.Dx(), tile.Rect.Dy()); err != nil {
 			return 0, err
 		}
-		pasteImage(canvas, tile, x, y)
+		patches = append(patches, screenPatch{image.Rect(x, y, x+tile.Rect.Dx(), y+tile.Rect.Dy()), tile})
 		cache.touch(key)
 		count++
 	}
@@ -359,17 +352,18 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 			if t.sx+t.w > aw || t.sy+t.h > ah {
 				return 0, errors.New("JPEG tile outside atlas")
 			}
-			pasteImage(canvas, cropImage(atlas, t.sx, t.sy, t.w, t.h), t.x, t.y)
+			patches = append(patches, screenPatch{image.Rect(t.x, t.y, t.x+t.w, t.y+t.h), atlas.SubImage(image.Rect(t.sx, t.sy, t.sx+t.w, t.sy+t.h)).(*image.RGBA)})
 			count++
 		}
 	}
 
 	if len(fields[1]) != 0 && len(fields[2]) != 0 {
-		n, err := s.applyRGB555(canvas, fields[1], fields[2])
+		decoded, err := s.decodeRGB555(fields[1], fields[2])
 		if err != nil {
 			return 0, err
 		}
-		count += n
+		patches = append(patches, decoded...)
+		count += len(decoded)
 	}
 
 	for off := 0; off < len(fields[10]); off += 12 {
@@ -377,15 +371,29 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 		y := i16(fields[10][off+2 : off+4])
 		w := i16(fields[10][off+4 : off+6])
 		h := i16(fields[10][off+6 : off+8])
-		key := i32(fields[10][off+8 : off+12])
 		if err := s.bounds(x, y, w, h); err != nil {
 			return 0, err
 		}
-		if _, ok := cache.get(key); !ok {
-			cache.add(key, cropImage(canvas, x, y, w, h))
-		}
 	}
 
+	// All operations have been decoded and validated. Commit patches in place;
+	// malformed updates never alter the original canvas or cache.
+	dirty := image.Rectangle{}
+	for _, patch := range patches {
+		pasteImage(canvas, patch.pixels, patch.rect.Min.X, patch.rect.Min.Y)
+		dirty = dirty.Union(patch.rect)
+	}
+	if canvas != original.canvas {
+		dirty = canvas.Rect
+	}
+	for off := 0; off < len(fields[10]); off += 12 {
+		r := fields[10][off:]
+		key := i32(r[8:])
+		if _, ok := cache.get(key); !ok {
+			cache.add(key, cropImage(canvas, i16(r), i16(r[2:]), i16(r[4:]), i16(r[6:])))
+		}
+	}
+	original.dirty = dirty
 	cache.trim()
 	original.canvas = canvas
 	original.cache = cache
@@ -393,12 +401,12 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 	return count, nil
 }
 
-func (s *rgb555Screen) applyRGB555(canvas *image.RGBA, rectField, pixelField []byte) (int, error) {
+func (s *rgb555Screen) decodeRGB555(rectField, pixelField []byte) ([]screenPatch, error) {
 	if len(rectField) == 0 || len(rectField)%8 != 0 {
-		return 0, errors.New("expected UInt16 x/y/w/h rectangle records")
+		return nil, errors.New("expected UInt16 x/y/w/h rectangle records")
 	}
 	if !bytes.HasPrefix(pixelField, []byte{0x28, 0xb5, 0x2f, 0xfd}) {
-		return 0, errors.New("screen codec is outside supported Zstandard subset")
+		return nil, errors.New("screen codec is outside supported Zstandard subset")
 	}
 	type rect struct{ x, y, w, h int }
 	var rects []rect
@@ -409,15 +417,16 @@ func (s *rgb555Screen) applyRGB555(canvas *image.RGBA, rectField, pixelField []b
 		w := u16(rectField[off+4 : off+6])
 		h := u16(rectField[off+6 : off+8])
 		if w == 0 || h == 0 || x+w > s.width || y+h > s.height {
-			return 0, errors.New("screen rectangle outside canvas")
+			return nil, errors.New("screen rectangle outside canvas")
 		}
 		rects = append(rects, rect{x, y, w, h})
 		total += w * h * 2
 	}
 	raw, err := s.decoder.decompress(pixelField, total)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
+	var patches []screenPatch
 	offset := 0
 	for _, r := range rects {
 		tile := image.NewRGBA(image.Rect(0, 0, r.w, r.h))
@@ -432,7 +441,7 @@ func (s *rgb555Screen) applyRGB555(canvas *image.RGBA, rectField, pixelField []b
 				tile.Pix[di+3] = 255
 			}
 		}
-		pasteImage(canvas, tile, r.x, r.y)
+		patches = append(patches, screenPatch{image.Rect(r.x, r.y, r.x+r.w, r.y+r.h), tile})
 	}
-	return len(rects), nil
+	return patches, nil
 }

@@ -7,3 +7,5 @@ config/legacy/*.json
 backend/internal/webui/dist/
 
 backend/internal/controller/private/
+
+.env

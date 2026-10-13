@@ -3,36 +3,42 @@ package controller
 import (
 	"anyviewer-go/internal/webui"
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"image"
 	"image/png"
+	"log"
 	"math"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 )
 
 type cmdItem struct {
-	payload   []byte
-	evType    string
-	button    string
-	vk        int
-	down      bool
-	unicode   bool
-	messageID string
+	controlEpoch uint64
+	payload      []byte
+	evType       string
+	button       string
+	vk           int
+	down         bool
+	unicode      bool
+	messageID    string
 }
 
 type viewerState struct {
-	State    string               `json:"state"`
-	Frames   int                  `json:"frames"`
-	Error    string               `json:"error,omitempty"`
-	Messages []chatMessage        `json:"messages,omitempty"`
-	Transfer *fileTransferState   `json:"transfer,omitempty"`
-	Incoming []*incomingFileState `json:"incoming,omitempty"`
+	PartnerID string               `json:"partner_id,omitempty"`
+	State     string               `json:"state"`
+	Stream    *streamStats         `json:"stream,omitempty"`
+	Frames    int                  `json:"frames"`
+	Error     string               `json:"error,omitempty"`
+	Messages  []chatMessage        `json:"messages,omitempty"`
+	Transfer  *fileTransferState   `json:"transfer,omitempty"`
+	Incoming  []*incomingFileState `json:"incoming,omitempty"`
 }
 
 type Viewer struct {
@@ -54,16 +60,27 @@ type Viewer struct {
 	lifecycle sync.Mutex
 	closing   bool
 
-	mu          sync.Mutex
-	commands    chan cmdItem
-	frame       []byte
-	state       viewerState
-	active      bool
-	curStop     chan struct{}
-	curDone     chan struct{}
-	curStopOnce *sync.Once
-	upload      *outgoingFile
-	incoming    map[string]*incomingFile
+	mu            sync.Mutex
+	commands      chan cmdItem
+	frame         []byte
+	screenMu      sync.RWMutex
+	screenImage   *image.RGBA
+	screenVersion uint64
+	screenChanges []screenChange
+	streamCancel  context.CancelFunc
+	controlEpoch  atomic.Uint64
+	controlCancel context.CancelFunc
+	controlDone   chan struct{}
+	onHeartbeat   func() bool
+	statusWake    chan struct{}
+	releaseInputs chan struct{}
+	state         viewerState
+	active        bool
+	curStop       chan struct{}
+	curDone       chan struct{}
+	curStopOnce   *sync.Once
+	upload        *outgoingFile
+	incoming      map[string]*incomingFile
 }
 
 func newViewer(reg registrationProfile, dictionary []byte, width, height, blockSize int, certPolicy bool) *Viewer {
@@ -78,6 +95,8 @@ func newViewer(reg registrationProfile, dictionary []byte, width, height, blockS
 		settings:       defaultViewerSettings(),
 		settingsFileMu: &sync.Mutex{},
 		commands:       make(chan cmdItem, 1024),
+		statusWake:     make(chan struct{}, 1),
+		releaseInputs:  make(chan struct{}, 1),
 		state:          viewerState{State: "disconnected"},
 	}
 }
@@ -119,12 +138,16 @@ func (v *Viewer) connect(partnerID string, password *string) error {
 	stop := make(chan struct{})
 	newDone := make(chan struct{})
 	once := &sync.Once{}
+	v.screenMu.Lock()
 	v.mu.Lock()
 	v.frame = nil
+	v.screenImage = nil
+	v.screenVersion++
+	v.screenChanges = nil
 	settings := v.settings
 	v.clearUploadLocked()
 	v.clearIncomingLocked(false)
-	v.state = viewerState{State: "connecting"}
+	v.state = viewerState{State: "connecting", PartnerID: partnerID}
 	v.clipboard = clipboardState{}
 	v.clipboardSent = ""
 	v.active = true
@@ -132,6 +155,7 @@ func (v *Viewer) connect(partnerID string, password *string) error {
 	v.curDone = newDone
 	v.curStopOnce = once
 	v.mu.Unlock()
+	v.screenMu.Unlock()
 
 	go v.run(partner, settings, stop, newDone)
 	return nil
@@ -147,10 +171,36 @@ func (v *Viewer) disconnect() {
 	}
 }
 
+func (v *Viewer) disconnectAndWait() {
+	v.lifecycle.Lock()
+	defer v.lifecycle.Unlock()
+	v.mu.Lock()
+	partner := v.state.PartnerID
+	state := v.state.State
+	v.mu.Unlock()
+	log.Printf("event=viewer_disconnect status=requested partner_id=%q state=%q", partner, state)
+	v.disconnect()
+	v.mu.Lock()
+	done := v.curDone
+	v.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+	log.Printf("event=viewer_disconnect status=completed partner_id=%q", partner)
+}
+
 func (v *Viewer) shutdown() {
 	v.lifecycle.Lock()
 	defer v.lifecycle.Unlock()
 	v.closing = true
+	v.mu.Lock()
+	if v.streamCancel != nil {
+		v.streamCancel()
+	}
+	if v.controlCancel != nil {
+		v.controlCancel()
+	}
+	v.mu.Unlock()
 	v.disconnect()
 	v.mu.Lock()
 	done := v.curDone
@@ -182,11 +232,13 @@ func stopped(stop chan struct{}) bool {
 	}
 }
 
-func (v *Viewer) event(value map[string]interface{}) error {
+func (v *Viewer) event(value map[string]interface{}) error { return v.eventWithEpoch(value, 0) }
+
+func (v *Viewer) eventWithEpoch(value map[string]interface{}, epoch uint64) error {
 	evType, _ := value["type"].(string)
 	var payload []byte
 	var err error
-	item := cmdItem{evType: evType}
+	item := cmdItem{evType: evType, controlEpoch: epoch}
 	switch evType {
 	case "move":
 		x, e1 := jsonInt(value, "x")
@@ -228,6 +280,9 @@ func (v *Viewer) event(value map[string]interface{}) error {
 	v.mu.Lock()
 	connected := v.state.State == "connected"
 	defer v.mu.Unlock()
+	if epoch != 0 && epoch != v.controlEpoch.Load() {
+		return errors.New("control channel closed")
+	}
 	if !connected {
 		return errors.New("session is not connected")
 	}
@@ -243,6 +298,7 @@ func (v *Viewer) setState(state string) {
 	v.mu.Lock()
 	v.state.State = state
 	v.mu.Unlock()
+	v.notifyStatus()
 }
 
 func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done chan struct{}) {
@@ -251,8 +307,19 @@ func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done
 	var runErr error
 	session := newControlSession(v.timeout, v.certPolicy)
 	session.settings = settings
+	ctx, cancel := context.WithCancel(context.Background())
+	session.ctx = ctx
+	defer cancel()
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+		case <-done:
+		}
+	}()
 	started := time.Now()
 	firstFrame := true
+	session.logf("event=viewer status=connecting")
 
 	defer func() {
 		reason := "remote_closed"
@@ -262,7 +329,6 @@ func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done
 			reason = "error"
 			session.logf("event=viewer status=failed error=%q", runErr)
 		}
-		session.logf("event=viewer status=disconnected reason=%q elapsed=%s", reason, time.Since(started))
 		for vk := range keys {
 			session.key(vk, false)
 		}
@@ -270,6 +336,7 @@ func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done
 			session.button(b, false)
 		}
 		session.close()
+		session.logf("event=viewer status=disconnected reason=%q sockets=closed elapsed=%s", reason, time.Since(started))
 		v.mu.Lock()
 		if runErr != nil && !stopped(stop) {
 			msg := runErr.Error()
@@ -279,6 +346,12 @@ func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done
 			v.state.Error = msg
 		}
 		v.state.State = "disconnected"
+		v.screenImage = nil
+		v.frame = nil
+		v.screenVersion++
+		v.screenChanges = nil
+		v.state.Frames = 0
+		v.state.Stream = nil
 		v.clearIncomingLocked(true)
 		v.clipboard = clipboardState{}
 		v.clipboardSent = ""
@@ -295,6 +368,7 @@ func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done
 		v.active = false
 		v.mu.Unlock()
 		close(done)
+		v.notifyStatus()
 	}()
 
 	dec, err := newZstdDictDecoder(v.dictionary)
@@ -318,10 +392,31 @@ func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done
 	session.relay.timeout = 150 * time.Millisecond
 
 	for !stopped(stop) {
+		select {
+		case <-v.releaseInputs:
+			for vk := range keys {
+				if e := session.key(vk, false); e != nil {
+					runErr = e
+					return
+				}
+				delete(keys, vk)
+			}
+			for button := range buttons {
+				if e := session.button(button, false); e != nil {
+					runErr = e
+					return
+				}
+				delete(buttons, button)
+			}
+		default:
+		}
 	drain:
 		for i := 0; i < 128; i++ {
 			select {
 			case it := <-v.commands:
+				if it.controlEpoch != 0 && it.controlEpoch != v.controlEpoch.Load() {
+					continue
+				}
 				if e := session.sendWithEncoding(it.payload, it.unicode); e != nil {
 					runErr = e
 					return
@@ -398,12 +493,9 @@ func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done
 			session.logf("event=viewer status=connected elapsed=%s", time.Since(started))
 			v.setState("connected")
 		case 1:
+			v.screenMu.Lock()
 			if _, e := screen.apply(fields); e != nil {
-				runErr = e
-				return
-			}
-			var buf bytes.Buffer
-			if e := png.Encode(&buf, screen.canvas); e != nil {
+				v.screenMu.Unlock()
 				runErr = e
 				return
 			}
@@ -411,10 +503,8 @@ func (v *Viewer) run(partner partnerProfile, settings viewerSettings, stop, done
 				session.logf("event=screen status=first_frame width=%d height=%d elapsed=%s", screen.canvas.Bounds().Dx(), screen.canvas.Bounds().Dy(), time.Since(started))
 				firstFrame = false
 			}
-			v.mu.Lock()
-			v.frame = buf.Bytes()
-			v.state.Frames++
-			v.mu.Unlock()
+			v.recordScreenLocked(screen.canvas, screen.dirty)
+			v.screenMu.Unlock()
 			if e := session.acknowledgeScreen(); e != nil {
 				runErr = e
 				return
@@ -471,15 +561,7 @@ func (v *Viewer) handler(indexHTML []byte, token string) http.Handler {
 	indexHTML = bytes.ReplaceAll(indexHTML, []byte("__TOKEN__"), []byte(token))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		addr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
-		validHost := ok && r.Host == addr.String()
-		if ok {
-			host, port, err := net.SplitHostPort(addr.String())
-			if err == nil && net.ParseIP(host).IsLoopback() {
-				validHost = validHost || r.Host == net.JoinHostPort("localhost", port)
-			}
-		}
-		if !validHost {
+		if !validHost(r) {
 			reply(w, 403, []byte("{}"), "application/json")
 			return
 		}
@@ -491,6 +573,20 @@ func (v *Viewer) handler(indexHTML []byte, token string) http.Handler {
 			}
 		}
 		switch {
+		case r.Method == http.MethodGet && (r.URL.Path == "/stream/ws" || r.URL.Path == "/stream/control"):
+			if subtle.ConstantTimeCompare([]byte(streamCredentials(r)[0]), []byte(token)) != 1 {
+				reply(w, 403, []byte("{}"), "application/json")
+				return
+			}
+			if r.URL.Path == "/stream/control" {
+				v.serveControlSocket(w, r)
+			} else {
+				v.serveWebSocket(w, r)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/stream/log":
+			v.serveStreamLog(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/stream/rtc":
+			v.serveWebRTC(w, r)
 		case r.Method == http.MethodGet && (r.URL.Path == "/" || r.URL.Path == "/index.html"):
 			v.mu.Lock()
 			theme := v.settings.Theme
@@ -524,9 +620,18 @@ func (v *Viewer) handler(indexHTML []byte, token string) http.Handler {
 			v.mu.Unlock()
 			reply(w, 200, data, "application/json")
 		case r.Method == http.MethodGet && r.URL.Path == "/frame.png":
+			snapshot := v.snapshotScreen(0, true)
 			v.mu.Lock()
 			frame := v.frame
 			v.mu.Unlock()
+			if snapshot.pixels != nil {
+				var buf bytes.Buffer
+				if err := png.Encode(&buf, snapshot.pixels); err != nil {
+					reply(w, 500, nil, "image/png")
+					return
+				}
+				frame = buf.Bytes()
+			}
 			if len(frame) > 0 {
 				reply(w, 200, frame, "image/png")
 			} else {
@@ -542,6 +647,7 @@ func (v *Viewer) handler(indexHTML []byte, token string) http.Handler {
 }
 
 func (v *Viewer) handlePost(w http.ResponseWriter, r *http.Request) {
+	defer v.notifyStatus()
 	if r.URL.Path == "/file" {
 		v.handleFileUpload(w, r)
 		return
@@ -609,7 +715,7 @@ func (v *Viewer) handlePost(w http.ResponseWriter, r *http.Request) {
 		}
 		err = v.connect(id, password)
 	case "/disconnect":
-		v.disconnect()
+		v.disconnectAndWait()
 	case "/chat":
 		message, e := jsonStr(value, "message")
 		if e != nil {

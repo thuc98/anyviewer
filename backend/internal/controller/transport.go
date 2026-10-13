@@ -24,6 +24,8 @@ const (
 var errTimeout = errors.New("transport deadline")
 
 type transport struct {
+	ctx        context.Context
+	stopClose  func() bool
 	timeout    time.Duration
 	maxFrame   int
 	certPolicy bool
@@ -42,7 +44,7 @@ func (t *transport) logf(format string, args ...any) {
 
 func newTransport(timeout time.Duration, certPolicy bool) *transport {
 	return &transport{
-		timeout:    timeout,
+		ctx: context.Background(), timeout: timeout,
 		maxFrame:   1024 * 1024,
 		certPolicy: certPolicy,
 		readbuf:    make([]byte, 4096),
@@ -76,7 +78,7 @@ func (t *transport) dial(host string, port int) (conn net.Conn, err error) {
 		}
 	}()
 	forward := &net.Dialer{Timeout: t.timeout}
-	ctx, cancel := context.WithTimeout(context.Background(), t.timeout)
+	ctx, cancel := context.WithTimeout(t.ctx, t.timeout)
 	defer cancel()
 	if !t.settings.SOCKS5Enabled {
 		return forward.DialContext(ctx, "tcp", address)
@@ -96,12 +98,20 @@ func (t *transport) dial(host string, port int) (conn net.Conn, err error) {
 	return conn, nil
 }
 
+func (t *transport) watchConnection(raw net.Conn) {
+	if t.stopClose != nil {
+		t.stopClose()
+	}
+	t.stopClose = context.AfterFunc(t.ctx, func() { raw.Close() })
+}
+
 func (t *transport) handshake(raw net.Conn) (*tls.Conn, error) {
 	started := time.Now()
 	t.logf("event=tls_handshake status=starting server_name=%q verify_certificate=%t", t.settings.TLSServerName, !t.certPolicy)
+	t.watchConnection(raw)
 	conn := tls.Client(raw, t.tlsConfig())
 	conn.SetDeadline(time.Now().Add(t.timeout))
-	if err := conn.Handshake(); err != nil {
+	if err := conn.HandshakeContext(t.ctx); err != nil {
 		t.logf("event=tls_handshake status=failed elapsed=%s error=%q", time.Since(started), err)
 		return nil, err
 	}
@@ -117,7 +127,7 @@ func (t *transport) connectRegistration(host string, port int) error {
 	}
 	addrs := []string{host}
 	if !t.settings.SOCKS5Enabled && net.ParseIP(host) == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), t.timeout)
+		ctx, cancel := context.WithTimeout(t.ctx, t.timeout)
 		ips, err := net.DefaultResolver.LookupHost(ctx, host)
 		cancel()
 		if err != nil {
@@ -182,6 +192,7 @@ func (t *transport) connectSession(host string, port int, httpHostname string, u
 	if err != nil {
 		return fmt.Errorf("TCP dial: %w", err)
 	}
+	t.watchConnection(raw)
 	t.conn = raw
 	if useSSL {
 		conn, err := t.handshake(raw)
@@ -347,6 +358,10 @@ func (t *transport) receiveMode1Payload() ([]byte, error) {
 }
 
 func (t *transport) Close() {
+	if t.stopClose != nil {
+		t.stopClose()
+		t.stopClose = nil
+	}
 	if t.conn != nil {
 		t.logf("event=transport_close status=closed local=%q peer=%q", t.conn.LocalAddr(), t.conn.RemoteAddr())
 		t.conn.Close()

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"errors"
@@ -47,6 +48,7 @@ func makePartnerProfile(id, password string) partnerProfile {
 }
 
 type controlSession struct {
+	ctx          context.Context
 	logID        string
 	timeout      time.Duration
 	certPolicy   bool
@@ -78,7 +80,7 @@ func (s *controlSession) logf(format string, args ...any) {
 }
 
 func newControlSession(timeout time.Duration, certPolicy bool) *controlSession {
-	return &controlSession{logID: strconv.FormatUint(connectionSequence.Add(1), 10), timeout: timeout, certPolicy: certPolicy, settings: defaultViewerSettings()}
+	return &controlSession{ctx: context.Background(), logID: strconv.FormatUint(connectionSequence.Add(1), 10), timeout: timeout, certPolicy: certPolicy, settings: defaultViewerSettings()}
 }
 
 func digits(n int) string {
@@ -121,6 +123,7 @@ func (s *controlSession) connect(reg registrationProfile, partner partnerProfile
 	s.registration = newTransport(s.timeout, s.certPolicy)
 	s.registration.logID, s.registration.role = s.logID, "registration"
 	s.registration.settings = s.settings
+	s.registration.ctx = s.ctx
 	if err = s.registration.connectRegistration(s.settings.RegistrationHost, 443); err != nil {
 		return err
 	}
@@ -207,6 +210,7 @@ func (s *controlSession) connect(reg registrationProfile, partner partnerProfile
 	s.relay = newTransport(s.timeout, s.certPolicy)
 	s.relay.logID, s.relay.role = s.logID, "relay"
 	s.relay.settings = s.settings
+	s.relay.ctx = s.ctx
 	if err = s.relay.connectSession(s.route.tcpServerIP, 443, s.route.tcpServerHostname, true); err != nil {
 		return err
 	}
