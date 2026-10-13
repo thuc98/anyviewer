@@ -1,0 +1,5 @@
+.DS_Store
+bin/
+frontend/node_modules/
+config/*.json
+config/legacy/*.json
