@@ -221,7 +221,6 @@ func (v *Viewer) serveWebRTC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx, cancel := v.startStream()
-	// Also close peers whose browser disappears before opening a data channel.
 	go func() { <-ctx.Done(); peer.Close() }()
 	var track *webrtc.TrackLocalStaticSample
 	feedback := make(chan videoFeedback, 1)
@@ -324,7 +323,6 @@ func (v *Viewer) serveWebRTC(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				err := v.pumpStream(ctx, "webrtc", func(packet []byte) error {
-					// Reliable ordered chunks stay below browser SCTP message limits.
 					deadline := time.NewTimer(10 * time.Second)
 					defer deadline.Stop()
 					pacing := time.NewTicker(5 * time.Millisecond)

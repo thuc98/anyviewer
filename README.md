@@ -13,6 +13,18 @@ A browser-based remote desktop viewer with a Go backend and React frontend. The 
 - Restore a tab's connected session after reload. Sessions expire after one minute without browser heartbeats.
 - Stream diagnostics for negotiation, ICE, FFmpeg errors, fallback, and disconnect cleanup.
 
+## Share your browser screen
+
+Click **Chia sẻ** → **Chọn màn hình và chia sẻ**, then select a screen/window/tab.
+Give the displayed ID and password to the UltraViewer viewer. Browser sharing
+sends screen images and supports text chat in **Nhắn tin với người xem** inside
+the sharing dialog. Remote keyboard, mouse, audio, and clipboard access are disabled.
+Sharing defaults to Full HD (1920×1080), JPEG quality 92%, and up to 30 FPS.
+Choose resolution, quality, and FPS in the sharing dialog. Changed regions are
+encoded in a background worker and forwarded without a second JPEG encode.
+Click **Dừng chia sẻ** to disconnect. Closing the dialog or reloading also stops
+capture. See [SHARING.md](SHARING.md) for transport and lifecycle details.
+
 ## Quick start with Docker
 
 Docker Compose builds the frontend and backend and installs FFmpeg/libvpx, CA certificates, timezone data, and the health-check dependencies.

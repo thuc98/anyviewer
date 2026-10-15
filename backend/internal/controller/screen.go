@@ -376,8 +376,6 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 		}
 	}
 
-	// All operations have been decoded and validated. Commit patches in place;
-	// malformed updates never alter the original canvas or cache.
 	dirty := image.Rectangle{}
 	for _, patch := range patches {
 		pasteImage(canvas, patch.pixels, patch.rect.Min.X, patch.rect.Min.Y)

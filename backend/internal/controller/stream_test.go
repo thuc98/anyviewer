@@ -66,7 +66,6 @@ func TestStreamEncodingDirtyAndResize(t *testing.T) {
 	if v.snapshotScreen(patch.version, false).pixels != nil {
 		t.Fatal("unchanged version copied")
 	}
-	// Subsequent in-place updates cannot change the captured patch.
 	after.SetRGBA(10, 20, color.RGBA{B: 255, A: 255})
 	if patch.pixels.RGBAAt(0, 0).R != 255 {
 		t.Fatal("patch shares mutable screen memory")
@@ -143,7 +142,6 @@ func TestWebSocketFramesAndAcknowledgement(t *testing.T) {
 	next.SetRGBA(5, 6, color.RGBA{G: 255, A: 255})
 	v.mu.Unlock()
 	publishTestScreen(v, next, image.Rect(5, 6, 6, 7))
-	// No second frame until browser acknowledges the first.
 	arrived := make(chan []byte, 1)
 	readErr := make(chan error, 1)
 	go func() {
@@ -193,7 +191,6 @@ func TestWebSocketRejectsBadCredentialsAndOrigin(t *testing.T) {
 
 func TestWebRTCFrameDelivery(t *testing.T) {
 	v, server := streamTestServer(t)
-	// Incompressible pixels force multiple SCTP chunks.
 	screen := image.NewRGBA(image.Rect(0, 0, 128, 128))
 	rand.New(rand.NewSource(1)).Read(screen.Pix)
 	publishTestScreen(v, screen, screen.Rect)

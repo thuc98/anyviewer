@@ -69,41 +69,9 @@ func (v *Viewer) receiveClipboard(kind int, fields [][]byte) error {
 	if !enabled {
 		return nil
 	}
-	var raw []byte
-	if kind == 5 {
-		if len(fields) != 2 {
-			return errors.New("invalid text clipboard packet")
-		}
-		raw = fields[1]
-	} else if kind == 33 {
-		if len(fields) != 3 || len(fields[1]) != 4 {
-			return errors.New("invalid compressed clipboard packet")
-		}
-		size := int(binary.LittleEndian.Uint32(fields[1]))
-		if size < 1 || size > maxClipboardBytes || size%2 != 0 {
-			return errors.New("clipboard exceeds allocation policy")
-		}
-		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(1024*1024), zstd.WithDecoderMaxWindow(1024*1024))
-		if err != nil {
-			return err
-		}
-		raw, err = dec.DecodeAll(fields[2], make([]byte, 0, size))
-		dec.Close()
-		if err != nil || len(raw) != size {
-			return errors.New("clipboard decompression failed or size differs")
-		}
-	} else {
-		return errors.New("unsupported clipboard packet")
-	}
-	if len(raw) == 0 || len(raw) > maxClipboardBytes {
-		return errors.New("clipboard exceeds allocation policy")
-	}
-	text, err := decodeUTF16LE(raw)
+	text, err := decodeClipboardPacket(kind, fields)
 	if err != nil {
 		return err
-	}
-	if strings.ContainsRune(text, 0) {
-		return errors.New("clipboard text contains NUL")
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -116,4 +84,44 @@ func (v *Viewer) receiveClipboard(kind int, fields [][]byte) error {
 		v.clipboard.Version++
 	}
 	return nil
+}
+
+func decodeClipboardPacket(kind int, fields [][]byte) (string, error) {
+	var raw []byte
+	if kind == 5 {
+		if len(fields) != 2 {
+			return "", errors.New("invalid text clipboard packet")
+		}
+		raw = fields[1]
+	} else if kind == 33 {
+		if len(fields) != 3 || len(fields[1]) != 4 {
+			return "", errors.New("invalid compressed clipboard packet")
+		}
+		size := int(binary.LittleEndian.Uint32(fields[1]))
+		if size < 1 || size > maxClipboardBytes || size%2 != 0 {
+			return "", errors.New("clipboard exceeds allocation policy")
+		}
+		dec, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(1024*1024), zstd.WithDecoderMaxWindow(1024*1024))
+		if err != nil {
+			return "", err
+		}
+		raw, err = dec.DecodeAll(fields[2], make([]byte, 0, size))
+		dec.Close()
+		if err != nil || len(raw) != size {
+			return "", errors.New("clipboard decompression failed or size differs")
+		}
+	} else {
+		return "", errors.New("unsupported clipboard packet")
+	}
+	if len(raw) == 0 || len(raw) > maxClipboardBytes {
+		return "", errors.New("clipboard exceeds allocation policy")
+	}
+	text, err := decodeUTF16LE(raw)
+	if err != nil {
+		return "", err
+	}
+	if strings.ContainsRune(text, 0) {
+		return "", errors.New("clipboard text contains NUL")
+	}
+	return text, nil
 }

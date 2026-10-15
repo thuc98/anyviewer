@@ -144,7 +144,7 @@ export function openScreenStream(mode, onFrame, onState, settings = {}, controls
                   }
                 });
                 data.send(JSON.stringify({type:'feedback',rtt_ms:rtt,loss,jitter_ms:jitter}));
-              } catch { /* Connection failure is handled by the peer state listener. */ }
+              } catch {  }
             },1000);
           }
         };

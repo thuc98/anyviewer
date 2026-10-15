@@ -1,4 +1,3 @@
-// Keep protocol and diagnostic errors in the backend; present actionable Vietnamese messages.
 const messages = [
   [/Wrong Password|Sai mật khẩu/i, 'Sai mật khẩu. Vui lòng kiểm tra mật khẩu của đối tác.'],
   [/không online|ID không tồn tại/i, 'Đối tác không trực tuyến hoặc ID không tồn tại.'],

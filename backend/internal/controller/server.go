@@ -76,6 +76,7 @@ type Viewer struct {
 	releaseInputs chan struct{}
 	state         viewerState
 	active        bool
+	sharing       *sharingSession
 	curStop       chan struct{}
 	curDone       chan struct{}
 	curStopOnce   *sync.Once
@@ -193,6 +194,7 @@ func (v *Viewer) shutdown() {
 	v.lifecycle.Lock()
 	defer v.lifecycle.Unlock()
 	v.closing = true
+	v.stopSharing()
 	v.mu.Lock()
 	if v.streamCancel != nil {
 		v.streamCancel()
@@ -573,18 +575,26 @@ func (v *Viewer) handler(indexHTML []byte, token string) http.Handler {
 			}
 		}
 		switch {
-		case r.Method == http.MethodGet && (r.URL.Path == "/stream/ws" || r.URL.Path == "/stream/control"):
+		case r.Method == http.MethodGet && (r.URL.Path == "/stream/ws" || r.URL.Path == "/stream/control" || r.URL.Path == "/share/ws"):
 			if subtle.ConstantTimeCompare([]byte(streamCredentials(r)[0]), []byte(token)) != 1 {
 				reply(w, 403, []byte("{}"), "application/json")
 				return
 			}
-			if r.URL.Path == "/stream/control" {
+			if r.URL.Path == "/share/ws" {
+				v.serveSharingUpload(w, r)
+			} else if r.URL.Path == "/stream/control" {
 				v.serveControlSocket(w, r)
 			} else {
 				v.serveWebSocket(w, r)
 			}
 		case r.Method == http.MethodPost && r.URL.Path == "/stream/log":
 			v.serveStreamLog(w, r)
+		case r.Method == http.MethodGet && r.URL.Path == "/share":
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Viewer-Token")), []byte(token)) != 1 {
+				reply(w, 403, []byte("{}"), "application/json")
+				return
+			}
+			v.serveSharingStatus(w, r)
 		case r.Method == http.MethodPost && r.URL.Path == "/stream/rtc":
 			v.serveWebRTC(w, r)
 		case r.Method == http.MethodGet && (r.URL.Path == "/" || r.URL.Path == "/index.html"):
@@ -688,6 +698,52 @@ func (v *Viewer) handlePost(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 	switch r.URL.Path {
+	case "/share/start":
+		width, e1 := jsonInt(value, "width")
+		height, e2 := jsonInt(value, "height")
+		if e1 != nil || e2 != nil {
+			err = errors.New("invalid sharing dimensions")
+		} else {
+			encoding, _ := value["encoding"].(string)
+			if encoding == "" {
+				encoding = "jpeg"
+			}
+			quality := 92
+			if _, ok := value["quality"]; ok {
+				quality, _ = jsonInt(value, "quality")
+			}
+			err = v.startSharingEncoded(width, height, encoding, quality)
+		}
+		if err == nil {
+			v.mu.Lock()
+			sourceID := v.sharing.sourceID
+			v.mu.Unlock()
+			data, _ := json.Marshal(map[string]string{"source_id": sourceID})
+			reply(w, 200, data, "application/json")
+			return
+		}
+	case "/share/chat":
+		message, e := jsonStr(value, "message")
+		v.mu.Lock()
+		h := v.sharing
+		v.mu.Unlock()
+		id, _ := value["source_id"].(string)
+		if e != nil {
+			err = e
+		} else if h == nil || id != h.sourceID {
+			err = errors.New("sharing is not active")
+		} else {
+			err = h.queueChat(message)
+		}
+	case "/share/stop":
+		v.lifecycle.Lock()
+		v.mu.Lock()
+		h := v.sharing
+		v.mu.Unlock()
+		if id, _ := value["source_id"].(string); h != nil && id == h.sourceID {
+			v.stopSharing()
+		}
+		v.lifecycle.Unlock()
 	case "/clipboard":
 		text, e := jsonStr(value, "text")
 		if e != nil {

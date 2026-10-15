@@ -186,7 +186,7 @@ func (s *Server) Handler() http.Handler {
 			reply(w, 200, data, "application/json")
 			return
 		}
-		if r.Method == "GET" && (r.URL.Path == "/stream/ws" || r.URL.Path == "/stream/control") {
+		if r.Method == "GET" && (r.URL.Path == "/stream/ws" || r.URL.Path == "/stream/control" || r.URL.Path == "/share/ws") {
 			credentials := streamCredentials(r)
 			r.Header.Set("X-Viewer-Token", credentials[0])
 			r.Header.Set("X-Viewer-Session", credentials[1])

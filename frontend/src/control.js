@@ -1,7 +1,5 @@
 import { errorMessage } from './errors.js';
 
-// Transport ordering preserves keys/buttons. Render traffic uses a separate
-// connection/channel so large images cannot sit ahead of control messages.
 export function createControl(send, onStatus, onReady, terminate = () => {}) {
   let ready=false, closed=false, sequence=0, heartbeat, timer;
   const pending=new Map();

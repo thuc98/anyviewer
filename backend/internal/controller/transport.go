@@ -24,18 +24,19 @@ const (
 var errTimeout = errors.New("transport deadline")
 
 type transport struct {
-	ctx        context.Context
-	stopClose  func() bool
-	timeout    time.Duration
-	maxFrame   int
-	certPolicy bool
-	conn       net.Conn
-	buffer     []byte
-	readbuf    []byte
-	respHeader []byte
-	settings   viewerSettings
-	logID      string
-	role       string
+	ctx          context.Context
+	stopClose    func() bool
+	timeout      time.Duration
+	writeTimeout time.Duration
+	maxFrame     int
+	certPolicy   bool
+	conn         net.Conn
+	buffer       []byte
+	readbuf      []byte
+	respHeader   []byte
+	settings     viewerSettings
+	logID        string
+	role         string
 }
 
 func (t *transport) logf(format string, args ...any) {
@@ -229,7 +230,11 @@ func (t *transport) writeAll(data []byte) error {
 	if t.conn == nil {
 		return errors.New("not connected")
 	}
-	t.conn.SetWriteDeadline(time.Now().Add(t.timeout))
+	timeout := t.timeout
+	if t.writeTimeout > 0 {
+		timeout = t.writeTimeout
+	}
+	t.conn.SetWriteDeadline(time.Now().Add(timeout))
 	_, err := t.conn.Write(data)
 	t.conn.SetWriteDeadline(time.Time{})
 	return err

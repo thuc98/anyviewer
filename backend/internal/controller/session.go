@@ -134,11 +134,7 @@ func (s *controlSession) connect(reg registrationProfile, partner partnerProfile
 	}
 	stage = "receive registration identity"
 	s.logf("event=registration status=waiting_for_identity")
-	idPayload, err := s.registration.receiveMode1Payload()
-	if err != nil {
-		return err
-	}
-	identity, err := extractCommand3Identity(idPayload, s.codec)
+	identity, err := receiveRegistrationIdentity(s.registration, s.codec)
 	if err != nil {
 		return err
 	}
@@ -235,6 +231,27 @@ func (s *controlSession) connect(reg registrationProfile, partner partnerProfile
 	}
 	s.logf("event=partner_login status=waiting_for_ack elapsed=%s", time.Since(started))
 	return nil
+}
+
+func receiveRegistrationIdentity(t *transport, codec string) (command3Identity, error) {
+	deadline := time.Now().Add(t.timeout)
+	original := t.timeout
+	defer func() { t.timeout = original }()
+	for i := 0; i < 16; i++ {
+		t.timeout = time.Until(deadline)
+		if t.timeout <= 0 {
+			return command3Identity{}, errTimeout
+		}
+		payload, err := t.receiveMode1Payload()
+		if err != nil {
+			return command3Identity{}, err
+		}
+		if strings.HasPrefix(string(payload), "3:") {
+			return extractCommand3Identity(payload, codec)
+		}
+		t.logf("event=registration_notice prefix=%q", firstField(payload))
+	}
+	return command3Identity{}, errors.New("registration identity was not received")
 }
 
 func (s *controlSession) send(payload []byte) error { return s.sendWithEncoding(payload, false) }

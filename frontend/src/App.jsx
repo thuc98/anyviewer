@@ -3,6 +3,7 @@ import { bootstrap, post, upload, downloadFile } from './api';
 import { useRemote } from './remote';
 import { useClipboard } from './clipboard';
 import { errorMessage } from './errors';
+import Sharing from './SharingPanel.jsx';
 
 function Icon({ name, size = 20 }) {
   const paths = {
@@ -179,6 +180,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sharingOpen, setSharingOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [unread, setUnread] = useState(0);
   const [notice, setNotice] = useState('');
@@ -232,10 +234,10 @@ export default function App() {
   const stateLabel = !remote.online ? 'Mất kết nối máy chủ' : { disconnected:'Chưa kết nối', connecting:'Đang kết nối', connected:'Đã kết nối' }[remote.status.state];
   return <div className={`app ${connected ? 'remote-connected' : ''} ${remote.ready ? '' : 'initializing'} ${toolbarAnimated ? 'toolbar-animated' : ''}`}>
     {connected && <button className="top-edge" aria-label="Hiện thanh điều khiển" onPointerEnter={showToolbar} onPointerLeave={hideToolbar} onClick={showToolbar} onFocus={showToolbar}><span/></button>}
-    <header className={`control-bar ${toolbarShown || toolbarFocused || settingsOpen ? 'revealed' : ''}`}
+    <header className={`control-bar ${toolbarShown || toolbarFocused || settingsOpen || sharingOpen ? 'revealed' : ''}`}
       onPointerEnter={showToolbar} onPointerLeave={hideToolbar}
       onFocusCapture={() => setToolbarFocused(true)} onBlurCapture={event => { if (!event.currentTarget.contains(event.relatedTarget)) setToolbarFocused(false); }}
-      inert={connected && !toolbarShown && !toolbarFocused && !settingsOpen ? true : undefined}>
+      inert={connected && !toolbarShown && !toolbarFocused && !settingsOpen && !sharingOpen ? true : undefined}>
       <span className="brand"><span className="brand-mark"><Icon name="monitor" size={19}/></span>AnyViewer</span>
       {!connected && <form className="connect-form" onSubmit={connect}>
         <input aria-label="ID đối tác" inputMode="numeric" autoComplete="off" placeholder="ID đối tác" required value={partner} disabled={active} onChange={e => setPartner(e.target.value.replace(/\s/g, ''))}/>
@@ -244,6 +246,7 @@ export default function App() {
       </form>}
       <span className={`status-badge ${connected ? 'connected' : active ? 'connecting' : ''}`}><span className={active && !connected ? 'pulse' : ''}/>{connected ? partner || stateLabel : stateLabel}</span>
       <div className="view-actions">
+        <button className="secondary compact" onClick={()=>setSharingOpen(true)} disabled={!settings}>Chia sẻ</button>
         <span className="view-tag" title={remote.streamError || (remote.status.stream ? `Định dạng: ${remote.status.stream.encoding.toUpperCase()} · ${remote.status.stream.fps.toFixed(0)} khung/giây · ${remote.status.stream.bitrate_kbps} kbps` : "Cơ chế truyền hình ảnh đang sử dụng")}>{{websocket:'WebSocket',webrtc:'WebRTC',polling:'Cập nhật định kỳ'}[remote.transport]}{remote.status.stream && ` · ${remote.status.stream.encoding.toUpperCase()}`}</span>
         {display.viewOnly && <span className="view-tag">Chỉ xem</span>}
         <button className="icon-button" title={display.fit ? 'Kích thước thật' : 'Vừa cửa sổ'} aria-label={display.fit ? 'Chuyển sang kích thước thật' : 'Chuyển sang vừa cửa sổ'} onClick={toggleFit} aria-pressed={display.fit}><Icon name="monitor"/></button>
@@ -269,5 +272,6 @@ export default function App() {
     {notice && <div className="toast" role="status"><Icon name="check" size={18}/>{notice}</div>}
     <div className="floating-tools"><Communication hidden={!chatOpen} status={remote.status} connected={connected} refresh={remote.refresh} onClose={() => setChatOpen(false)}/><button className={`chat-toggle ${chatOpen ? 'opened' : ''}`} onClick={() => setChatOpen(!chatOpen)} aria-label={chatOpen ? 'Ẩn nhắn tin và gửi tệp' : 'Hiện nhắn tin và gửi tệp'} title={chatOpen ? 'Ẩn nhắn tin và gửi tệp' : 'Hiện nhắn tin và gửi tệp'} aria-expanded={chatOpen}><Icon name="chevron" size={18}/>{!chatOpen && unread > 0 && <span className="unread">{unread}</span>}</button></div>
     {settingsOpen && <Settings settings={settings} display={display} connecting={remote.status.state === 'connecting'} onClose={() => setSettingsOpen(false)} onSave={saveSettings}/>}
+    {sharingOpen && <Sharing onClose={()=>setSharingOpen(false)}/>}
   </div>;
 }

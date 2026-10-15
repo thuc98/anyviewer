@@ -19,8 +19,6 @@ export function bootstrap() {
     const data=await responseData(response);
     token=data.token;session=data.session;
     try {sessionStorage.setItem(sessionKey,session);sessionStorage.setItem('anyviewer-token',token);} catch {}
-    // Reload/navigation keeps the controller alive. Missing status heartbeats
-    // expire its session after one minute on the backend.
 
     return data.settings;
   })();
