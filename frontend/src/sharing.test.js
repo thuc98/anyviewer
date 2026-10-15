@@ -69,3 +69,48 @@ test('Browser sharing releases capture if preview startup fails',async t=>{
   assert.equal(env.video.srcObject,null);
   await assert.rejects(startBrowserShare({fps:Infinity,sendFrame:async()=>{}}),/không hợp lệ/);
 });
+
+test('Duplicate decoded video frames skip encoding and send a lightweight heartbeat',async t=>{
+  const env=captureEnvironment(t);
+  env.video.getVideoPlaybackQuality=()=>({totalVideoFrames:1});
+  const original=Object.getOwnPropertyDescriptor(globalThis,'performance');
+  let now=0;
+  Object.defineProperty(globalThis,'performance',{configurable:true,value:{now:()=>now}});
+  t.after(()=>Object.defineProperty(globalThis,'performance',original));
+  let first,heartbeat;
+  const initial=new Promise(resolve=>{first=resolve;});
+  const idle=new Promise(resolve=>{heartbeat=resolve;});
+  const share=await startBrowserShare({fps:60,sendFrame:async(frame,size)=>{if(frame)first();else heartbeat(size);}});
+  t.after(()=>share.stop());
+  await initial;
+  await new Promise(resolve=>setTimeout(resolve,40));
+  assert.equal(env.calls.draws,1);
+  now=6000;
+  const size=await idle;
+  assert.deepEqual(size,{width:1920,height:1080,heartbeat:true});
+  assert.equal(env.calls.draws,1,'heartbeat must not encode another full image');
+  share.stop();
+});
+
+test('Background capture resizes the bitmap before transfer and releases its worker',async t=>{
+  captureEnvironment(t);
+  const saved=['Worker','OffscreenCanvas','createImageBitmap'].map(name=>[name,Object.getOwnPropertyDescriptor(globalThis,name)]);
+  t.after(()=>{for(const [name,value] of saved){if(value)Object.defineProperty(globalThis,name,value);else delete globalThis[name];}});
+  let options,terminated=false,transferred;
+  class Worker {
+    postMessage(data,transfer){transferred=transfer;queueMicrotask(()=>this.onmessage({data:{blob:new Blob(['jpeg']),metadata:{width:data.width,height:data.height,encoding:'native-jpeg'}}}));}
+    terminate(){terminated=true;}
+  }
+  Object.defineProperty(globalThis,'Worker',{configurable:true,value:Worker});
+  Object.defineProperty(globalThis,'OffscreenCanvas',{configurable:true,value:class {}});
+  const bitmap={close(){}};
+  Object.defineProperty(globalThis,'createImageBitmap',{configurable:true,value:async(video,value)=>{options=value;return bitmap;}});
+  let first;
+  const ready=new Promise(resolve=>{first=resolve;});
+  const share=await startBrowserShare({nativeFrames:true,sendFrame:async()=>first()});
+  t.after(()=>share.stop());
+  await ready;
+  assert.deepEqual(options,{resizeWidth:1920,resizeHeight:1080});
+  assert.deepEqual(transferred,[bitmap]);
+  share.stop();assert.equal(terminated,true);
+});

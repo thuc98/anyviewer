@@ -8,7 +8,7 @@ export async function startBrowserShare({sendFrame, onStop=()=>{}, onError=()=>{
   const video=document.createElement('video');
   const canvas=document.createElement('canvas');
   video.muted=true;video.playsInline=true;
-  let closed=false,timer,frameSize,worker,work;
+  let closed=false,timer,frameSize,worker,work,lastVideoFrame,lastDelivery=performance.now();
   function stop() {
     if(closed) return;
     closed=true;clearTimeout(timer);
@@ -41,12 +41,19 @@ export async function startBrowserShare({sendFrame, onStop=()=>{}, onError=()=>{
           const scale=Math.min(1,maxWidth/video.videoWidth,maxHeight/video.videoHeight);
           if(!frameSize) frameSize={width:Math.max(1,Math.round(video.videoWidth*scale)),height:Math.max(1,Math.round(video.videoHeight*scale))};
           const {width,height}=frameSize;
-          if(worker){
-            const bitmap=await createImageBitmap(video);
+          const decoded=video.getVideoPlaybackQuality?.().totalVideoFrames;
+          const duplicate=decoded>0 && decoded===lastVideoFrame;
+          lastVideoFrame=decoded;
+          if(duplicate){
+            if(performance.now()-lastDelivery>=5000){await sendFrame(null,{width,height,heartbeat:true});lastDelivery=performance.now();}
+          } else if(worker){
+            const bitmapScale=Math.min(1,width/video.videoWidth,height/video.videoHeight);
+            const bitmap=await createImageBitmap(video,{resizeWidth:Math.max(1,Math.round(video.videoWidth*bitmapScale)),resizeHeight:Math.max(1,Math.round(video.videoHeight*bitmapScale))});
             if(closed){bitmap.close();return;}
             const result=await new Promise((resolve,reject)=>{work={resolve,reject};worker.postMessage({bitmap,width,height,quality},[bitmap]);});
             if(closed)return;
-            if(!result.empty) await sendFrame(result.blob,result.metadata);
+            if(!result.empty){await sendFrame(result.blob,result.metadata);lastDelivery=performance.now();}
+            else if(performance.now()-lastDelivery>=5000){await sendFrame(null,{width,height,heartbeat:true});lastDelivery=performance.now();}
           } else {
           if(canvas.width!==width || canvas.height!==height) {canvas.width=width;canvas.height=height;}
           const fitted=Math.min(width/video.videoWidth,height/video.videoHeight);
@@ -56,7 +63,7 @@ export async function startBrowserShare({sendFrame, onStop=()=>{}, onError=()=>{
           const frame=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',quality));
           if(closed) return;
           if(!frame) throw new Error('Không thể mã hóa hình ảnh chia sẻ.');
-          await sendFrame(frame,{width,height});
+          await sendFrame(frame,{width,height});lastDelivery=performance.now();
           }
         }
         if(!closed) timer=setTimeout(capture,Math.max(0,1000/fps-(performance.now()-started)));

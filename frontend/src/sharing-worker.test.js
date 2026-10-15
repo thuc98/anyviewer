@@ -4,7 +4,7 @@ import {readFile} from 'node:fs/promises';
 import vm from 'node:vm';
 import {changedRegion} from './sharing-frame.js';
 
-test('sharing worker flips JPEG once, skips unchanged frames, and refreshes an idle source',async()=>{
+test('sharing worker flips JPEG once, skips unchanged frames, without periodic full-image spikes',async()=>{
   const messages=[],transforms=[],encoded=[];
   let now=0,closed=0;
   class Canvas {
@@ -22,6 +22,6 @@ test('sharing worker flips JPEG once, skips unchanged frames, and refreshes an i
   assert.deepEqual(transforms[0],[1,0,0,-1,0,48]);
   assert.equal(encoded[0].quality,.92);
   await send();assert.equal(messages[1].empty,true);assert.equal(encoded.length,1);
-  now=5001;await send();assert.equal(messages[2].metadata.full,true);assert.equal(encoded.length,2);
+  now=5001;await send();assert.equal(messages[2].empty,true);assert.equal(encoded.length,1);
   assert.equal(closed,3);
 });

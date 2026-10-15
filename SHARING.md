@@ -21,16 +21,20 @@ The sharing dialog offers HD, Full HD, or 2560×1440, quality 80/92/98%, and
 The initial canvas size remains fixed; source-window resizes are letterboxed.
 
 A background worker compares 32-pixel tiles and encodes only the bounding region
-that changed. Unchanged captures are skipped; a full frame every five seconds
-refreshes the source and keeps the upload alive. JPEG is encoded in native
+that changed. Unchanged captures and duplicate decoded video frames are skipped. Idle sources
+send a lightweight heartbeat every five seconds instead of resending full images. JPEG is encoded in native
 bottom-up orientation and forwarded without another JPEG encode. Browsers without
 worker canvas support use the full-frame compatibility path.
 
-Frames upload through the authenticated `/share/ws` WebSocket. Capture waits for
-an upload acknowledgement, and the native relay allows one frame awaiting screen
-acknowledgement. Slow receivers get merged pending regions; newly connected
+Frames upload through the authenticated `/share/ws` WebSocket. While connected,
+an upload is acknowledged only after that version has been written to the relay.
+This permits at most one frame ahead of the frame awaiting the viewer
+acknowledgement and prevents capture from outrunning a slow receiver. Before a
+viewer connects, upload acknowledgements limit capture to five uploads per second. Slow receivers get merged pending regions; newly connected
 receivers get the complete reconstructed screen. A bounded 32-region history
-falls back to a full snapshot when the receiver falls further behind. JPEG quality
+falls back to a full snapshot when the receiver falls further behind. Full native
+JPEGs stay compressed; a pixel canvas is reconstructed only when a partial patch
+needs its base. JPEG quality
 is reduced only when needed to fit the relay's 1 MB packet limit. Actual FPS
 still depends on capture, JPEG processing, relay round-trip time, and the receiver.
 
@@ -72,7 +76,7 @@ header length, followed by that JSON and the bottom-up JPEG bytes. Header fields
 `width`, `height` (full canvas), `x`, `y` (patch position), `full`, and
 `encoding: "native-jpeg"`. The JPEG supplies patch dimensions. The first frame
 must cover the full canvas. Legacy `jpeg` uploads contain an ordinary full-frame
-JPEG without a header.
+JPEG without a header. A text `ping` receives `ack` without changing the screen.
 
 ## Verification
 
@@ -84,3 +88,19 @@ cd ../backend
 go test -race ./...
 UV_SHARING_INTEGRATION=1 go test -race ./internal/controller -run TestSharingLiveRelay -v -count=1
 ```
+
+## Performance diagnostics
+
+The backend logs `event=sharing_stream` while frames are flowing, with delivered
+FPS, kbps, and average viewer acknowledgement time (`ack_ms`). These values help
+separate capture/encoding work from relay and viewer latency. They contain no
+screen content or credentials.
+
+Run the Full HD upload benchmark with:
+
+```bash
+cd backend
+go test ./internal/controller -run '^$' -bench BenchmarkSharingNativeUpload1080 -benchmem
+```
+
+This measures backend upload processing only; it does not predict end-to-end FPS.

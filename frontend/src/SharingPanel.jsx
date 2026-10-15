@@ -68,7 +68,8 @@ export default function Sharing({onClose}) {
       if(stopped) throw new Error('Đã dừng chia sẻ.');
       return new Promise((resolve,reject)=>{
         pending={resolve,reject,timer:setTimeout(()=>{reject(new Error('Gửi hình ảnh quá thời gian.'));close();},10000)};
-        if(size.encoding==='native-jpeg'){
+        if(size.heartbeat) socket.send('ping');
+        else if(size.encoding==='native-jpeg'){
           const header=new TextEncoder().encode(JSON.stringify(size));
           const length=new Uint8Array(4);new DataView(length.buffer).setUint32(0,header.length,false);
           socket.send(new Blob([length,header,frame]));

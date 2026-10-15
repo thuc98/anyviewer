@@ -256,9 +256,6 @@ func TestSharingLiveRelay(t *testing.T) {
 	if screen.canvas.RGBAAt(0, 0).R < 220 || screen.canvas.RGBAAt(64, 48).G < 220 {
 		t.Fatal("live shared image differs")
 	}
-	if err = client.acknowledgeScreen(); err != nil {
-		t.Fatal(err)
-	}
 	patch := image.NewRGBA(image.Rect(0, 0, 8, 8))
 	for y := 0; y < 8; y++ {
 		for x := 0; x < 8; x++ {
@@ -269,10 +266,30 @@ func TestSharingLiveRelay(t *testing.T) {
 	if err = h.acceptFrame(data); err != nil {
 		t.Fatal(err)
 	}
+	delivery := make(chan error, 1)
+	go func() { delivery <- h.waitDelivery(ctx, 2) }()
+	select {
+	case <-delivery:
+		t.Fatal("slow peer did not hold upload acknowledgement")
+	case <-time.After(30 * time.Millisecond):
+	}
+	if err = client.acknowledgeScreen(); err != nil {
+		t.Fatal(err)
+	}
+
 	kind, fields, err = client.receive()
 	if err != nil || kind != 1 {
 		t.Fatalf("live dirty frame failed: kind=%d error=%v", kind, err)
 	}
+	select {
+	case err := <-delivery:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("relay did not release queued frame")
+	}
+
 	if _, err = screen.apply(fields); err != nil {
 		t.Fatal(err)
 	}
@@ -507,4 +524,182 @@ func TestSharingChatHTTPIsolation(t *testing.T) {
 	if len(v.state.Messages) != 0 {
 		t.Fatal("sharing chat leaked into outgoing viewer session")
 	}
+}
+
+func TestSharingUploadWaitsForRelayDelivery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := &sharingSession{ctx: ctx, state: sharingState{State: "connected"}}
+	delivered := make(chan error, 1)
+	go func() { delivered <- h.waitDelivery(ctx, 2) }()
+	select {
+	case <-delivered:
+		t.Fatal("upload acknowledged before relay delivery")
+	case <-time.After(25 * time.Millisecond):
+	}
+	h.mu.Lock()
+	h.delivered = 1
+	h.signalLocked()
+	h.mu.Unlock()
+	select {
+	case <-delivered:
+		t.Fatal("previous frame released next upload")
+	case <-time.After(25 * time.Millisecond):
+	}
+	h.mu.Lock()
+	h.delivered = 2
+	h.signalLocked()
+	h.mu.Unlock()
+	select {
+	case err := <-delivered:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("relay delivery did not release upload")
+	}
+	go func() { delivered <- h.waitDelivery(ctx, 3) }()
+	cancel()
+	select {
+	case err := <-delivered:
+		if err == nil {
+			t.Fatal("cancelled delivery accepted")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled upload remained blocked")
+	}
+}
+
+func TestSharingFullJPEGStaysCompressedUntilPatch(t *testing.T) {
+	h := &sharingSession{native: true, state: sharingState{Width: 65, Height: 49}}
+	data, jpegBytes := nativeSharingUpload(t, sharingTestImage(), image.Rect(0, 0, 65, 49))
+	if err := h.acceptFrame(data); err != nil {
+		t.Fatal(err)
+	}
+	if h.frame != nil || !bytes.Equal(h.fullJPEG, jpegBytes) {
+		t.Fatal("full JPEG was unnecessarily decoded")
+	}
+	packet, _, err := h.nextFrame(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields, _ := decodeByteArrayFields(packet)
+	if !bytes.Equal(fields[7], jpegBytes) || h.frame != nil {
+		t.Fatal("full JPEG passthrough changed")
+	}
+	patch, _ := nativeSharingUpload(t, image.NewRGBA(image.Rect(0, 0, 8, 8)), image.Rect(0, 0, 8, 8))
+	if err := h.acceptFrame(patch); err != nil {
+		t.Fatal(err)
+	}
+	if h.frame == nil || h.fullJPEG != nil {
+		t.Fatal("partial patch did not materialize its base")
+	}
+	if h.frame.At(64, 48).(color.RGBA).G < 220 {
+		t.Fatal("lazy reconstruction lost the full frame")
+	}
+	if err := h.acceptFrame(data[:len(data)-2]); err == nil {
+		t.Fatal("truncated native JPEG accepted")
+	}
+}
+
+func TestSharingLiveFullHD(t *testing.T) {
+	if os.Getenv("UV_SHARING_INTEGRATION") != "1" {
+		t.Skip("set UV_SHARING_INTEGRATION=1 to exercise the live relay")
+	}
+	addresses, err := net.LookupIP(defaultRegHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var host string
+	for _, address := range addresses {
+		if ip := address.To4(); ip != nil {
+			host = ip.String()
+			break
+		}
+	}
+	if host == "" {
+		t.Fatal("registration service has no IPv4 address")
+	}
+	v := newViewer(registrationProfile{}, defaultDictionary, 1920, 1080, 32, true)
+	v.settings.RegistrationHost = host
+	defer v.shutdown()
+	if err = v.startSharingEncoded(1920, 1080, "native-jpeg", 92); err != nil {
+		t.Fatal(err)
+	}
+	h := v.sharing
+	data := benchmarkSharingFrame(t)
+	if err = h.acceptFrame(data); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for h.status().State == "registering" && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	state := h.status()
+	if state.State != "ready" {
+		t.Fatalf("registration failed: %s", state.Error)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client := newControlSession(8*time.Second, true)
+	client.ctx = ctx
+	client.settings.RegistrationHost = host
+	defer client.close()
+	reg, err := defaultRegistrationProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.Terms[9] = reg.Terms[1]
+	if err = client.connect(reg, makePartnerProfile(state.ID, state.Password)); err != nil {
+		t.Fatal(err)
+	}
+	if kind, _, err := client.receive(); err != nil || kind != 0 {
+		t.Fatalf("login failed: kind=%d error=%v", kind, err)
+	}
+	const count = 30
+	production := make(chan error, 1)
+	go func() {
+		for i := 1; i < count; i++ {
+			started := time.Now()
+			if err := h.waitDelivery(ctx, uint64(i)); err != nil {
+				production <- err
+				return
+			}
+			select {
+			case <-ctx.Done():
+				production <- ctx.Err()
+				return
+			case <-time.After(max(0, time.Second/30-time.Since(started))):
+			}
+			if err := h.acceptFrame(data); err != nil {
+				production <- err
+				return
+			}
+		}
+		production <- nil
+	}()
+	started := time.Now()
+	var bytesReceived int
+	for i := 0; i < count; i++ {
+		kind, fields, err := client.receive()
+		if err != nil || kind != 1 {
+			t.Fatalf("frame %d failed: kind=%d error=%v", i, kind, err)
+		}
+		image, err := jpeg.Decode(bytes.NewReader(fields[7]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if image.Bounds().Dx() != 1920 || image.Bounds().Dy() != 1080 {
+			t.Fatal("Full HD dimensions changed")
+		}
+		bytesReceived += len(fields[7])
+		if err = client.acknowledgeScreen(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = <-production; err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	t.Logf("Full HD real-relay delivery: frames=%d fps=%.1f jpeg_kbps=%.0f duration=%s", count, float64(count)/elapsed.Seconds(), float64(bytesReceived)*8/elapsed.Seconds()/1000, elapsed)
 }

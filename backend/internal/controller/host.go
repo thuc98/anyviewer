@@ -47,7 +47,10 @@ type sharingSession struct {
 	mu        sync.Mutex
 	state     sharingState
 	frame     image.Image
+	fullJPEG  []byte
 	version   uint64
+	delivered uint64
+	changed   chan struct{}
 	patch     []byte
 	patchRect image.Rectangle
 	history   []sharingPatch
@@ -148,6 +151,7 @@ func (h *sharingSession) run() {
 		h.state.ID = ""
 		h.state.Password = ""
 		h.frame = nil
+		h.fullJPEG = nil
 		if runErr != nil && !errors.Is(runErr, context.Canceled) {
 			h.state.Error = runErr.Error()
 		}
@@ -218,6 +222,7 @@ func (h *sharingSession) run() {
 			h.peer = false
 			if h.ctx.Err() == nil {
 				h.state.State = "ready"
+				h.signalLocked()
 				if err != nil {
 					h.state.Error = err.Error()
 				}
@@ -318,6 +323,8 @@ func (h *sharingSession) servePeer(reg *transport, in shareInvitation) error {
 	h.mu.Lock()
 	h.chatQueue = make(chan chatMessage, 32)
 	h.state.State = "connected"
+	h.delivered = 0
+	h.signalLocked()
 	h.mu.Unlock()
 	defer func() {
 		h.mu.Lock()
@@ -330,11 +337,27 @@ func (h *sharingSession) servePeer(reg *transport, in shareInvitation) error {
 		}
 	}()
 	log.Printf("event=sharing_peer status=authenticated")
-	relay.timeout = 20 * time.Millisecond
+	relay.timeout = 5 * time.Millisecond
 	var sent uint64
 	canSend := false
 	var ackDeadline time.Time
+	var frameSent time.Time
+	statsAt := time.Now()
+	var frames, bytesSent, acks int
+	var ackTime time.Duration
 	for ctx.Err() == nil {
+		if elapsed := time.Since(statsAt); elapsed >= 5*time.Second && frames > 0 {
+			var average time.Duration
+			if acks > 0 {
+				average = ackTime / time.Duration(acks)
+			}
+			log.Printf("event=sharing_stream fps=%.1f kbps=%.0f ack_ms=%.1f", float64(frames)/elapsed.Seconds(), float64(bytesSent)*8/elapsed.Seconds()/1000, float64(average)/float64(time.Millisecond))
+			statsAt = time.Now()
+			frames = 0
+			bytesSent = 0
+			acks = 0
+			ackTime = 0
+		}
 		if err := h.sendPendingChat(send); err != nil {
 			return err
 		}
@@ -351,10 +374,15 @@ func (h *sharingSession) servePeer(reg *transport, in shareInvitation) error {
 					return err
 				}
 				sent = version
+				frames++
+				bytesSent += len(encoded)
+				frameSent = time.Now()
 				canSend = false
 				ackDeadline = time.Now().Add(15 * time.Second)
 				h.mu.Lock()
 				h.state.Frames++
+				h.delivered = version
+				h.signalLocked()
 				h.mu.Unlock()
 			}
 		}
@@ -389,6 +417,11 @@ func (h *sharingSession) servePeer(reg *transport, in shareInvitation) error {
 		}
 		switch string(command) {
 		case "17", "18":
+			if string(command) == "18" && !frameSent.IsZero() {
+				acks++
+				ackTime += time.Since(frameSent)
+				frameSent = time.Time{}
+			}
 			canSend = true
 			ackDeadline = time.Time{}
 		case "ping":
@@ -491,10 +524,18 @@ func (v *Viewer) serveSharingUpload(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
-		if kind != websocket.MessageBinary {
-			return
-		}
-		if err = h.acceptFrame(data); err != nil {
+		if kind == websocket.MessageText && string(data) == "ping" {
+		} else if kind == websocket.MessageBinary {
+			if err = h.acceptFrame(data); err != nil {
+				return
+			}
+			h.mu.Lock()
+			version := h.version
+			h.mu.Unlock()
+			if err = h.waitDelivery(h.ctx, version); err != nil {
+				return
+			}
+		} else {
 			return
 		}
 		if v.onHeartbeat != nil && !v.onHeartbeat() {
@@ -556,21 +597,37 @@ func (h *sharingSession) acceptFrame(data []byte) error {
 	if h.native && len(packet)+8 > 1024*1024 {
 		return errors.New("sharing frame exceeds relay payload limit")
 	}
-	img, err := jpeg.Decode(bytes.NewReader(data))
-	if err != nil {
-		return err
+	if h.native && !bytes.HasSuffix(data, []byte{0xff, 0xd9}) {
+		return errors.New("invalid sharing JPEG")
+	}
+	var img image.Image
+	if !h.native || rect != bounds {
+		img, err = jpeg.Decode(bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.native {
-		if h.frame == nil && rect != bounds {
+		if h.version == 0 && rect != bounds {
 			return errors.New("sharing requires an initial full frame")
 		}
-		if h.frame == nil {
-			h.frame = image.NewRGBA(bounds)
-		}
-		for y := 0; y < rect.Dy(); y++ {
-			draw.Draw(h.frame.(*image.RGBA), image.Rect(rect.Min.X, rect.Min.Y+y, rect.Max.X, rect.Min.Y+y+1), img, image.Pt(0, rect.Dy()-1-y), draw.Src)
+		if rect == bounds {
+			h.fullJPEG = data
+			h.frame = nil
+		} else {
+			if h.frame == nil {
+				base, err := jpeg.Decode(bytes.NewReader(h.fullJPEG))
+				if err != nil {
+					return err
+				}
+				canvas := image.NewRGBA(bounds)
+				copySharingPatch(canvas, base, bounds)
+				h.frame = canvas
+				h.fullJPEG = nil
+			}
+			copySharingPatch(h.frame.(*image.RGBA), img, rect)
 		}
 		h.patch = packet
 		h.patchRect = rect
@@ -590,11 +647,11 @@ func (h *sharingSession) acceptFrame(data []byte) error {
 func (h *sharingSession) nextFrame(sent uint64) ([]byte, uint64, error) {
 	h.mu.Lock()
 	version := h.version
-	if h.frame == nil || sent == version {
+	if version == 0 || sent == version {
 		h.mu.Unlock()
 		return nil, version, nil
 	}
-	if h.native && (sent+1 == version && sent != 0 || h.patchRect == h.frame.Bounds()) {
+	if h.native && (sent+1 == version && sent != 0 || h.patchRect == image.Rect(0, 0, h.state.Width, h.state.Height)) {
 		packet := h.patch
 		h.mu.Unlock()
 		return packet, version, nil
@@ -682,4 +739,52 @@ func (h *sharingSession) sendPendingChat(send func([]byte) error) error {
 		}
 	}
 	return nil
+}
+
+func (h *sharingSession) signalLocked() {
+	if h.changed != nil {
+		close(h.changed)
+	}
+	h.changed = make(chan struct{})
+}
+
+func (h *sharingSession) waitDelivery(ctx context.Context, version uint64) error {
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	idle := time.NewTimer(200 * time.Millisecond)
+	defer idle.Stop()
+	for {
+		h.mu.Lock()
+		connected := h.state.State == "connected"
+		delivered := h.delivered >= version
+		if h.changed == nil {
+			h.changed = make(chan struct{})
+		}
+		changed := h.changed
+		h.mu.Unlock()
+		if connected && delivered {
+			return nil
+		}
+		if connected {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-changed:
+			}
+		} else {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-idle.C:
+				return nil
+			case <-changed:
+			}
+		}
+	}
+}
+
+func copySharingPatch(dst *image.RGBA, src image.Image, rect image.Rectangle) {
+	for y := 0; y < rect.Dy(); y++ {
+		draw.Draw(dst, image.Rect(rect.Min.X, rect.Min.Y+y, rect.Max.X, rect.Min.Y+y+1), src, image.Pt(0, rect.Dy()-1-y), draw.Src)
+	}
 }
