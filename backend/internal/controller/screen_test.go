@@ -6,6 +6,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"strings"
 	"testing"
 )
 
@@ -15,6 +16,60 @@ func screenRectangle(x, y, w, h int) []byte {
 		binary.LittleEndian.PutUint16(record[i*2:], uint16(v))
 	}
 	return record
+}
+
+func TestScreenJPEGNarrowAtlasColumns(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		width, next int
+		invalid     bool
+	}{
+		{"compact", 24, 8, false},
+		{"padded", 48, 32, false},
+		{"truncated", 23, 8, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			screen, err := newRGB555Screen(64, 64, nil, 32)
+			if err != nil {
+				t.Fatal(err)
+			}
+			atlas := newCanvas(tc.width, 32)
+			for y := 0; y < 32; y++ {
+				for x := 0; x < tc.width; x++ {
+					c := color.RGBA{R: 255, A: 255}
+					if x >= tc.next {
+						c = color.RGBA{G: 255, A: 255}
+					}
+					atlas.SetRGBA(x, y, c)
+				}
+			}
+			var encoded bytes.Buffer
+			if err := jpeg.Encode(&encoded, atlas, &jpeg.Options{Quality: 100}); err != nil {
+				t.Fatal(err)
+			}
+			fields := make([][]byte, 11)
+			fields[0] = []byte{1}
+			fields[7] = encoded.Bytes()
+			fields[8] = append(screenRectangle(2, 3, 8, 32), screenRectangle(20, 10, 16, 32)...)
+			before := append([]byte(nil), screen.canvas.Pix...)
+			count, err := screen.apply(fields)
+			if tc.invalid {
+				if err == nil || !strings.Contains(err.Error(), "atlas=23x32") {
+					t.Fatalf("expected detailed bounds error, got %v", err)
+				}
+				if !bytes.Equal(before, screen.canvas.Pix) {
+					t.Fatal("invalid atlas changed canvas")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count != 2 || screen.canvas.RGBAAt(5, 15).R < 240 || screen.canvas.RGBAAt(30, 20).G < 240 {
+				t.Fatal("atlas columns mapped to incorrect screen pixels")
+			}
+		})
+	}
 }
 
 func TestScreenExpandsForJPEGAndCache(t *testing.T) {

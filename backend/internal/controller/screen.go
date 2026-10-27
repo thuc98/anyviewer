@@ -349,8 +349,18 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 			return 0, err
 		}
 		for _, t := range tiles {
+			if t.sx+t.w > aw {
+				// Retry without padding narrow columns to the block size.
+				tiles, err = packAtlas(rects, s.blockSize, ah, true)
+				if err != nil {
+					return 0, err
+				}
+				break
+			}
+		}
+		for _, t := range tiles {
 			if t.sx+t.w > aw || t.sy+t.h > ah {
-				return 0, errors.New("JPEG tile outside atlas")
+				return 0, fmt.Errorf("JPEG tile outside atlas: source=(%d,%d %dx%d) destination=(%d,%d) atlas=%dx%d block_size=%d rectangles=%d", t.sx, t.sy, t.w, t.h, t.x, t.y, aw, ah, s.blockSize, len(rects))
 			}
 			patches = append(patches, screenPatch{image.Rect(t.x, t.y, t.x+t.w, t.y+t.h), atlas.SubImage(image.Rect(t.sx, t.sy, t.sx+t.w, t.sy+t.h)).(*image.RGBA)})
 			count++

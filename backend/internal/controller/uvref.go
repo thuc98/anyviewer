@@ -406,12 +406,16 @@ type atlasTile struct {
 }
 
 func atlasLayout(rectangles [][4]int, blockSize, atlasHeight int) ([]atlasTile, error) {
+	return packAtlas(rectangles, blockSize, atlasHeight, false)
+}
+
+func packAtlas(rectangles [][4]int, blockSize, atlasHeight int, compactColumns bool) ([]atlasTile, error) {
 	if blockSize <= 0 || atlasHeight <= 0 {
 		return nil, errors.New("invalid atlas geometry")
 	}
 	var tiles []atlasTile
 	atlasY := 0
-	column := 0
+	atlasX, columnWidth := 0, 0
 	for _, r := range rectangles {
 		x, y, width, height := r[0], r[1], r[2], r[3]
 		if width < 0 || height < 0 {
@@ -426,11 +430,17 @@ func atlasLayout(rectangles [][4]int, blockSize, atlasHeight int) ([]atlasTile, 
 				}
 				if atlasY+tileHeight > atlasHeight {
 					atlasY = 0
-					column++
+					if compactColumns {
+						atlasX += columnWidth
+					} else {
+						atlasX += blockSize
+					}
+					columnWidth = 0
 				}
+				columnWidth = max(columnWidth, tileWidth)
 				tiles = append(tiles, atlasTile{
 					x: x + dx, y: y + dy, w: tileWidth, h: tileHeight,
-					sx: column * blockSize, sy: atlasY,
+					sx: atlasX, sy: atlasY,
 				})
 				atlasY += tileHeight
 			}
