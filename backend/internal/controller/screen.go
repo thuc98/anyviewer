@@ -76,6 +76,16 @@ func cropImage(src *image.RGBA, x, y, w, h int) *image.RGBA {
 	return out
 }
 
+func cropRGB555(src *image.RGBA, x, y, w, h int) *image.RGBA {
+	out := cropImage(src, x, y, w, h)
+	for i := 0; i < len(out.Pix); i += 4 {
+		for c := 0; c < 3; c++ {
+			out.Pix[i+c] = uint8(int(out.Pix[i+c]>>3) * 255 / 31)
+		}
+	}
+	return out
+}
+
 type tileCache struct {
 	items map[int32]*image.RGBA
 	order []int32
@@ -138,6 +148,7 @@ type screenPatch struct {
 type rgb555Screen struct {
 	dirty     image.Rectangle
 	canvas    *image.RGBA
+	temporary *image.RGBA
 	decoder   *zstdDictDecoder
 	cache     *tileCache
 	blockSize int
@@ -183,7 +194,7 @@ func (s *rgb555Screen) updateSize(fields [][]byte) (int, int, error) {
 		}
 		return nil
 	}
-	for _, index := range []int{1, 8, 10} {
+	for _, index := range []int{1, 5, 8, 10} {
 		stride := 8
 		if index == 10 {
 			stride = 12
@@ -234,9 +245,6 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 	if len(fields) != 11 || len(fields[0]) == 0 || fields[0][0] != 1 {
 		return 0, errors.New("expected eleven-field kind1 update")
 	}
-	if len(fields[5]) != 0 {
-		return 0, errors.New("BitBlt screen operations are not supported yet")
-	}
 	if len(fields[9])%8 != 0 || len(fields[10])%12 != 0 {
 		return 0, errors.New("invalid screen cache record length")
 	}
@@ -256,6 +264,15 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 		pasteImage(canvas, s.canvas, 0, 0)
 	}
 	cache := s.cache.clone()
+	temporary := s.temporary
+	if temporary == nil || temporary.Rect != canvas.Rect {
+		temporary = newCanvas(width, height)
+		if s.temporary != nil {
+			pasteImage(temporary, s.temporary, 0, 0)
+		}
+	} else if len(fields[6])+len(fields[9])+len(fields[1])+len(fields[10]) != 0 {
+		temporary = cloneCanvas(temporary)
+	}
 	var patches []screenPatch
 	count := 0
 
@@ -272,7 +289,8 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 			return 0, err
 		}
 
-		shifted := cropImage(canvas, x, y, w, h)
+		shifted := cropRGB555(canvas, x, y, w, h)
+		pasteImage(temporary, shifted, x, y-delta)
 		rest := fields[6][10:]
 		for off := 0; off < len(rest); off += 8 {
 			rx := i16(rest[off : off+2])
@@ -282,10 +300,7 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 			if err := s.bounds(rx, ry, rw, rh); err != nil {
 				return 0, err
 			}
-			if rx < x || rx+rw > x+w || ry < y-delta || ry+rh > y-delta+h {
-				return 0, errors.New("scroll-copy references uncopied intermediate pixels")
-			}
-			patches = append(patches, screenPatch{image.Rect(rx, ry, rx+rw, ry+rh), cropImage(shifted, rx-x, ry-(y-delta), rw, rh)})
+			patches = append(patches, screenPatch{image.Rect(rx, ry, rx+rw, ry+rh), cropImage(temporary, rx, ry, rw, rh)})
 			count++
 		}
 	}
@@ -301,8 +316,14 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 		if err := s.bounds(x, y, tile.Rect.Dx(), tile.Rect.Dy()); err != nil {
 			return 0, err
 		}
-		patches = append(patches, screenPatch{image.Rect(x, y, x+tile.Rect.Dx(), y+tile.Rect.Dy()), tile})
+		pasteImage(temporary, tile, x, y)
 		cache.touch(key)
+	}
+
+	for off := 0; off < len(fields[5]); off += 8 {
+		r := fields[5][off:]
+		x, y, w, h := i16(r), i16(r[2:]), i16(r[4:]), i16(r[6:])
+		patches = append(patches, screenPatch{image.Rect(x, y, x+w, y+h), cropImage(temporary, x, y, w, h)})
 		count++
 	}
 
@@ -344,7 +365,8 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 			}
 			rects = append(rects, [4]int{x, y, w, h})
 		}
-		tiles, err := atlasLayout(rects, s.blockSize, ah)
+		blockSize := s.blockSize
+		tiles, err := atlasLayout(rects, blockSize, ah)
 		if err != nil {
 			return 0, err
 		}
@@ -359,8 +381,19 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 			}
 		}
 		for _, t := range tiles {
+			if t.w > aw {
+				// A single-column atlas can use tiles smaller than the configured block.
+				blockSize = aw
+				tiles, err = atlasLayout(rects, blockSize, ah)
+				if err != nil {
+					return 0, err
+				}
+				break
+			}
+		}
+		for _, t := range tiles {
 			if t.sx+t.w > aw || t.sy+t.h > ah {
-				return 0, fmt.Errorf("JPEG tile outside atlas: source=(%d,%d %dx%d) destination=(%d,%d) atlas=%dx%d block_size=%d rectangles=%d", t.sx, t.sy, t.w, t.h, t.x, t.y, aw, ah, s.blockSize, len(rects))
+				return 0, fmt.Errorf("JPEG tile outside atlas: source=(%d,%d %dx%d) destination=(%d,%d) atlas=%dx%d block_size=%d configured_block_size=%d rectangles=%d", t.sx, t.sy, t.w, t.h, t.x, t.y, aw, ah, blockSize, s.blockSize, len(rects))
 			}
 			patches = append(patches, screenPatch{image.Rect(t.x, t.y, t.x+t.w, t.y+t.h), atlas.SubImage(image.Rect(t.sx, t.sy, t.sx+t.w, t.sy+t.h)).(*image.RGBA)})
 			count++
@@ -373,6 +406,9 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 			return 0, err
 		}
 		patches = append(patches, decoded...)
+		for _, patch := range decoded {
+			pasteImage(temporary, patch.pixels, 0, 0)
+		}
 		count += len(decoded)
 	}
 
@@ -397,13 +433,16 @@ func (s *rgb555Screen) apply(fields [][]byte) (int, error) {
 	for off := 0; off < len(fields[10]); off += 12 {
 		r := fields[10][off:]
 		key := i32(r[8:])
+		tile := cropRGB555(canvas, i16(r), i16(r[2:]), i16(r[4:]), i16(r[6:]))
+		pasteImage(temporary, tile, i16(r), i16(r[2:]))
 		if _, ok := cache.get(key); !ok {
-			cache.add(key, cropImage(canvas, i16(r), i16(r[2:]), i16(r[4:]), i16(r[6:])))
+			cache.add(key, tile)
 		}
 	}
 	original.dirty = dirty
 	cache.trim()
 	original.canvas = canvas
+	original.temporary = temporary
 	original.cache = cache
 	original.width, original.height = width, height
 	return count, nil

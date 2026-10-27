@@ -156,7 +156,7 @@ WebRTC uses direct host ICE candidates. STUN/TURN is not configured. For Docker/
 - **WebRTC cannot connect through Docker:** check `VIEWER_WEBRTC_IP` and UDP 50000–50020. WebSocket remains available as fallback.
 - **Clipboard does not work:** enable synchronization and grant the browser's clipboard permission. Browser clipboard APIs require localhost or HTTPS.
 - **Remote still appears connected:** inspect `event=viewer_disconnect` and the native `sockets=closed` log. Confirm that you are viewing the intended tab/session.
-- **Unsupported screen operation:** the decoder supports JPEG atlases, RGB555/Zstandard updates, cached tiles, and scroll copies. BitBlt updates are not supported.
+- **Screen decoding:** the decoder supports JPEG atlases, RGB555/Zstandard updates, cached tiles, scroll copies, and BitBlt copies from the persistent RGB555 working buffer.
 
 Native logs go to standard output/error. Docker logs are available with:
 

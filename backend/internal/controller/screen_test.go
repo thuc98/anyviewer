@@ -18,6 +18,71 @@ func screenRectangle(x, y, w, h int) []byte {
 	return record
 }
 
+func TestScreenJPEG16PixelAtlas(t *testing.T) {
+	screen, err := newRGB555Screen(64, 1080, nil, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := make([][]byte, 11)
+	fields[0] = []byte{1}
+	atlas := newCanvas(16, 2576)
+	type sample struct {
+		x, y int
+		c    color.RGBA
+	}
+	var samples []sample
+	slot := 0
+	for i := 0; i < 66; i++ {
+		w := 32
+		if i >= 37 {
+			w = 48
+		}
+		fields[8] = append(fields[8], screenRectangle(0, i*16, w, 16)...)
+		for x := 0; x < w; x += 16 {
+			c := color.RGBA{R: 255, A: 255}
+			if slot%2 != 0 {
+				c = color.RGBA{G: 255, A: 255}
+			}
+			for y := 0; y < 16; y++ {
+				for ax := 0; ax < 16; ax++ {
+					atlas.SetRGBA(ax, 2575-(slot*16+y), c)
+				}
+			}
+			samples = append(samples, sample{x + 8, i*16 + 8, c})
+			slot++
+		}
+	}
+	var encoded bytes.Buffer
+	if err := jpeg.Encode(&encoded, atlas, &jpeg.Options{Quality: 100}); err != nil {
+		t.Fatal(err)
+	}
+	fields[7] = encoded.Bytes()
+	count, err := screen.apply(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 161 {
+		t.Fatalf("decoded %d tiles, want 161", count)
+	}
+	for _, p := range samples {
+		got := screen.canvas.RGBAAt(p.x, p.y)
+		if p.c.R == 255 && got.R < 240 || p.c.G == 255 && got.G < 240 {
+			t.Fatalf("pixel (%d,%d) = %v, want %v", p.x, p.y, got, p.c)
+		}
+	}
+	if screen.blockSize != 32 {
+		t.Fatal("frame-specific tile size changed the configured block size")
+	}
+	before := append([]byte(nil), screen.canvas.Pix...)
+	fields[8] = append(fields[8], screenRectangle(0, 1064, 16, 16)...)
+	if _, err := screen.apply(fields); err == nil {
+		t.Fatal("accepted more tiles than the 16-pixel atlas contains")
+	}
+	if !bytes.Equal(before, screen.canvas.Pix) {
+		t.Fatal("invalid atlas changed canvas")
+	}
+}
+
 func TestScreenJPEGNarrowAtlasColumns(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -108,6 +173,7 @@ func TestScreenExpandsForJPEGAndCache(t *testing.T) {
 	binary.LittleEndian.PutUint16(fields[9], 2000)
 	binary.LittleEndian.PutUint16(fields[9][2:], 1200)
 	binary.LittleEndian.PutUint32(fields[9][4:], 123)
+	fields[5] = screenRectangle(2000, 1200, 32, 32)
 	if _, err := screen.apply(fields); err != nil {
 		t.Fatal(err)
 	}
@@ -158,6 +224,7 @@ func TestScreenStagesPatchesBeforeCommitAndTracksDirty(t *testing.T) {
 	binary.LittleEndian.PutUint16(fields[9], 10)
 	binary.LittleEndian.PutUint16(fields[9][2:], 20)
 	binary.LittleEndian.PutUint32(fields[9][4:], 123)
+	fields[5] = screenRectangle(10, 20, 2, 2)
 	fields[7] = []byte("invalid JPEG")
 	before := screen.canvas
 	if _, err = screen.apply(fields); err == nil {
